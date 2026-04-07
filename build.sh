@@ -52,10 +52,14 @@ install_openvino_from_source() {
   git submodule update --init --recursive
 
   ## applying ov22.3 patches to enable Enhanced BasicVSR model
-  for patch_file in $(find ../patches -iname "*.patch" | sort -n);do
-      echo "Applying: ${patch_file}"
-      git am --whitespace=fix ${patch_file}
-  done
+  if git describe --exact-match HEAD 2>/dev/null | grep -q "^${ov_branch}$"; then
+    for patch_file in $(find ../patches -iname "*.patch" | sort -n);do
+        echo "Applying: ${patch_file}"
+        git am --whitespace=fix ${patch_file}
+    done
+  else
+    echo "OpenVINO patches already applied, skipping..."
+  fi
 
   mkdir -p build && cd build && \
   cmake \
@@ -109,20 +113,48 @@ build_ffmpeg() {
     DEBIAN_FRONTEND=noninteractive sudo apt-get install -y --no-install-recommends \
     ca-certificates tar g++ wget pkg-config nasm yasm libglib2.0-dev flex bison gobject-introspection libgirepository1.0-dev \
     python3-dev libx11-dev libxv-dev libxt-dev libasound2-dev libpango1.0-dev libtheora-dev libvisual-0.4-dev libgl1-mesa-dev \
-    libcurl4-gnutls-dev librtmp-dev libx264-dev libx265-dev libde265-dev libva-dev libtbb-dev
-  
-  # Add commands to build FFMPEG from source
+    libcurl4-gnutls-dev librtmp-dev libx264-dev libx265-dev libde265-dev libva-dev libtbb-dev \
+    patchutils
+
   ffmpeg_dir=$base_dir/ivsr_ffmpeg_plugin/ffmpeg
+  ffmpeg_tag=n8.1
   ffmpeg_repo=https://github.com/FFmpeg/FFmpeg.git
 
-  if [ ! -d "${ffmpeg_dir}" ]; then
-    git clone --depth 1 --branch n7.1 ${ffmpeg_repo} ${ffmpeg_dir}
+  if [ ! -d "${ffmpeg_dir}/.git" ]; then
+    git clone --depth 1 --branch ${ffmpeg_tag} ${ffmpeg_repo} ${ffmpeg_dir}
     git config --global --add safe.directory ${ffmpeg_dir}
   fi
 
-  # Apply patches
-  cd ${ffmpeg_dir} && cp -rf $base_dir/ivsr_ffmpeg_plugin/patches/*.patch .
-  git am --whitespace=fix *.patch
+  cd ${ffmpeg_dir}
+  git am --abort 2>/dev/null || true
+  # Ensure the target tag is locally reachable (handles a prior clone at a different tag)
+  if ! git rev-parse "${ffmpeg_tag}" >/dev/null 2>&1; then
+    git fetch --depth 1 origin "refs/tags/${ffmpeg_tag}:refs/tags/${ffmpeg_tag}"
+  fi
+  git checkout -f "${ffmpeg_tag}"
+
+  # ---------------------------------------------------------------
+  # Apply all iVSR patches for n8.1.
+  # Patch 0001: strip configure, dnn_interface.c, and swscale_unscaled.c
+  #   hunks — those three files are fully covered by patch 0004.
+  # Patch 0004: n8.1-native patch for configure, dnn_interface.c and
+  #   swscale_unscaled.c (exact n8.1 context; no sed required).
+  # Patches 0002/0003: fix-ups for dnn_backend_ivsr.c (added by 0001).
+  # ---------------------------------------------------------------
+  rm -f *.patch
+  cp "$base_dir/ivsr_ffmpeg_plugin/patches/"*.patch .
+
+  filterdiff \
+    -x '*/configure' \
+    -x '*/dnn_interface.c' \
+    -x '*/swscale_unscaled.c' \
+    0001-*.patch | \
+    git apply --3way --ignore-whitespace -
+
+  git apply --ignore-whitespace 0004-*.patch
+
+  git apply --3way --whitespace=fix 0002-*.patch
+  git apply --3way --whitespace=fix 0003-*.patch
 
   ./configure \
       --enable-gpl \
@@ -143,14 +175,34 @@ build_ffmpeg() {
 install_openvino_from_apt() {
   echo "Installing OpenVINO from apt..."
   local version=$1
+  local keyring=/etc/apt/keyrings/intel-sw-products.gpg
+  local key_url=https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
 
-  wget -qO - https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | sudo apt-key add -
+  # Use the modern keyring approach (apt-key is deprecated on Ubuntu 22+)
+  sudo mkdir -p /etc/apt/keyrings
 
-  echo "deb https://apt.repos.intel.com/openvino/2023 ubuntu22 main" | sudo tee /etc/apt/sources.list.d/intel-openvino-2023.list
-  echo "deb https://apt.repos.intel.com/openvino/2024 ubuntu22 main" | sudo tee /etc/apt/sources.list.d/intel-openvino-2024.list
+  # Download GPG key with timeout; fail loudly if it doesn't work
+  if ! wget --timeout=30 --tries=3 -O /tmp/intel-sw-products.pub "${key_url}"; then
+    echo "ERROR: Failed to download Intel GPG key from ${key_url}" >&2
+    exit 1
+  fi
+  gpg --dearmor < /tmp/intel-sw-products.pub | sudo tee "${keyring}" > /dev/null
+  rm -f /tmp/intel-sw-products.pub
+
+  if [ ! -s "${keyring}" ]; then
+    echo "ERROR: Intel GPG keyring is empty after dearmor step." >&2
+    exit 1
+  fi
+
+  # Determine which year repo to add based on version (2023.x vs 2024.x)
+  local year
+  year=$(echo "$version" | cut -d. -f1)
+
+  echo "deb [signed-by=${keyring}] https://apt.repos.intel.com/openvino/${year} ubuntu22 main" \
+    | sudo tee /etc/apt/sources.list.d/intel-openvino-${year}.list
 
   sudo -E apt-get update && \
-    DEBIAN_FRONTEND=noninteractive sudo -E apt-get install -y openvino-$version.0
+    DEBIAN_FRONTEND=noninteractive sudo -E apt-get install -y openvino-${version}.0
 }
 
 main() {

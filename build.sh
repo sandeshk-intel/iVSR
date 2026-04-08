@@ -6,11 +6,11 @@
 set -e
 
 base_dir=$(pwd)
-ov_version=2022.3
+ov_version=2026.1
 
 # Function to display usage information
 usage() {
-    echo "Usage: $0  --ov_version [2022.3|2023.2|2024.5]"
+    echo "Usage: $0  --ov_version [2022.3|2024.5|2026.1]"
     exit 1
 }
 
@@ -18,8 +18,8 @@ prepare_dependencies() {
   echo "Preparing dependencies..."
   sudo apt-get install -y --no-install-recommends \
     curl ca-certificates gpg-agent software-properties-common
-  
-  sudo apt-get install -y --no-install-recommends --fix-missing \
+
+  sudo apt-get install -y --no-install-recommends \
     autoconf \
     automake \
     build-essential \
@@ -153,6 +153,9 @@ build_ffmpeg() {
 
   git apply --ignore-whitespace 0004-*.patch
 
+  # Stage new files added by 0001 so 3-way merge can resolve them
+  git add -A
+
   git apply --3way --whitespace=fix 0002-*.patch
   git apply --3way --whitespace=fix 0003-*.patch
 
@@ -175,18 +178,15 @@ build_ffmpeg() {
 install_openvino_from_apt() {
   echo "Installing OpenVINO from apt..."
   local version=$1
-  local keyring=/etc/apt/keyrings/intel-sw-products.gpg
   local key_url=https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
-
-  # Use the modern keyring approach (apt-key is deprecated on Ubuntu 22+)
-  sudo mkdir -p /etc/apt/keyrings
+  local keyring=/etc/apt/trusted.gpg.d/intel.gpg
 
   # Download GPG key with timeout; fail loudly if it doesn't work
   if ! wget --timeout=30 --tries=3 -O /tmp/intel-sw-products.pub "${key_url}"; then
     echo "ERROR: Failed to download Intel GPG key from ${key_url}" >&2
     exit 1
   fi
-  gpg --dearmor < /tmp/intel-sw-products.pub | sudo tee "${keyring}" > /dev/null
+  sudo gpg --output "${keyring}" --dearmor /tmp/intel-sw-products.pub
   rm -f /tmp/intel-sw-products.pub
 
   if [ ! -s "${keyring}" ]; then
@@ -194,12 +194,14 @@ install_openvino_from_apt() {
     exit 1
   fi
 
-  # Determine which year repo to add based on version (2023.x vs 2024.x)
-  local year
-  year=$(echo "$version" | cut -d. -f1)
+  # Unified repo (all versions from 2024 onwards live here; no year in path)
+  # Detect Ubuntu codename suffix expected by the repo (ubuntu22 / ubuntu24)
+  local ubuntu_major
+  ubuntu_major=$(lsb_release -rs | cut -d. -f1)
+  local dist="ubuntu${ubuntu_major}"
 
-  echo "deb [signed-by=${keyring}] https://apt.repos.intel.com/openvino/${year} ubuntu22 main" \
-    | sudo tee /etc/apt/sources.list.d/intel-openvino-${year}.list
+  echo "deb https://apt.repos.intel.com/openvino ${dist} main" \
+    | sudo tee /etc/apt/sources.list.d/intel-openvino.list
 
   sudo -E apt-get update && \
     DEBIAN_FRONTEND=noninteractive sudo -E apt-get install -y openvino-${version}.0

@@ -97,6 +97,7 @@ git apply --ignore-whitespace 0004-*.patch
 
 git apply --3way --whitespace=fix 0002-*.patch
 git apply --3way --whitespace=fix 0003-*.patch
+git apply --3way --whitespace=fix 0005-*.patch
 ```
 
 All `sed` commands that had previously been used to patch `configure` at build time have been removed — that logic is now fully encoded in patch 0004.
@@ -141,3 +142,52 @@ After a clean build from the updated `build.sh`:
 | `0004` | `git apply` | `configure`, `dnn_interface.c`, `swscale_unscaled.c` |
 | `0002` | `git apply --3way` | `dnn_backend_ivsr.c` |
 | `0003` | `git apply --3way` | `dnn_backend_ivsr.c` |
+| `0005` | `git apply --3way` | `dnn_backend_ivsr.c` |
+
+---
+
+## RIFE Model Support — Patch 0005
+
+### New file: `patches/0005-Add-RIFE-model-support-to-dnn_backend_ivsr.patch`
+
+Adds frame interpolation support for the RIFE model to `libavfilter/dnn/dnn_backend_ivsr.c`.
+
+#### Changes summary
+
+**`ModelType` enum**
+- Adds `RIFE` (frame interpolation, 2-frame 6-channel input) before `MODEL_TYPE_NUM`.
+
+**`IVSRModel` struct**
+- Adds `rife_frame_num` sliding-window init counter (parallel to the existing `tsenet_frame_num` which replaces the former `static int frame_num`).
+- The pre-existing `static int frame_num` variable in `fill_model_input_ivsr` is replaced by the instance field `tsenet_frame_num`, fixing a data-race / multi-instance bug.
+
+**`fill_model_input_ivsr()`**
+- For `RIFE`: divides the reported channel count by `nif` (2) so each `ff_proc_from_frame_to_dnn` call fills exactly one frame's worth of channels.
+- Adds RIFE sliding-window input path: queues 2 consecutive frames, then manually packs them into the NCHW float tensor as normalized `[0, 1]` RGB planes — bypassing `sws_scale` which would collapse RGB to luma and produce incorrect value ranges.
+
+**`infer_completion_callback()`**
+- Adds `RIFE` to the `DCO_RGB` output order switch.
+- Adds RIFE-specific output path: converts float32 NCHW/NHWC `[0, 1]` tensor back to packed `rgb24` — bypassing `ff_proc_from_dnn_to_frame` which applies luma range expansion causing wave/colour artefacts.
+- Fixes a latent bug for other models: the `DL_NCHW → DL_NONE` layout reset after `convert_nchw_to_nhwc` is now applied so downstream sws stride calculations are correct.
+
+**`get_input_ivsr()`**
+- For `RIFE`: reports 3 channels (halves the model's 6-channel input) so the filter graph accepts standard `rgb24` frames.
+
+**`ff_dnn_load_model_ivsr()`**
+- Sets `NCHW` / `f32` layout and precision for both input and output tensors when model type is `RIFE`.
+- Enforces 128-aligned `frame_h` / `frame_w` for the RIFE shape string (model was exported with 128-aligned dimensions).
+- Adds `RIFE` to the `RGB` color format switch.
+- Sets `ivsr_model->nif = 2` for RIFE (hard-coded, same pattern as TSENet's `nif = 3`).
+
+#### Usage
+
+```
+ffmpeg -i input.mp4 \
+  -vf "scale,format=rgb24,split[a][b]; \
+       [b]dnn_processing=dnn_backend=ivsr:model=rife.xml:model_type=5[ri]; \
+       [ri]setpts=PTS+1/(2*FRAME_RATE*TB)[interp]; \
+       [a][interp]interleave=nb_inputs=2:duration=longest" \
+  output.mp4
+```
+
+`model_type=5` corresponds to the `RIFE` enum value.

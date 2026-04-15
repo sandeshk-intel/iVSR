@@ -26,6 +26,9 @@ DEFAULT_OP_XML = str(
     _REPO_ROOT / "ivsr_ov/based_on_openvino_2022.3/openvino/flow_warp_cl_kernel/flow_warp.xml"
 )
 
+# Default RIFE model path (sibling rife_ov directory)
+DEFAULT_RIFE_MODEL = str(_REPO_ROOT.parent / "rife_ov" / "rife.xml")
+
 # Mapping: display name → (model_type int, nif default, normalize_factor default,
 #          needs_extension, pixel_format, description)
 VSR_MODELS = {
@@ -196,6 +199,139 @@ def build_ffmpeg_cmd(
     if extra_encode_flags:
         cmd += extra_encode_flags.split()
 
+    cmd.append(output_video)
+    return cmd
+
+
+def align_to_128(value: int) -> int:
+    """Round up to the nearest multiple of 128 (required by RIFE model)."""
+    return ((value + 127) // 128) * 128
+
+
+def build_rife_ffmpeg_cmd(
+    ffmpeg_bin: str,
+    input_video: str,
+    output_video: str,
+    model_path: str,
+    target_w: int,
+    target_h: int,
+    device: str,
+    nireq: int,
+    num_streams: int,
+    mode: str,          # "2xfps" or "midpoints"
+    src_fps: float = 25.0,
+    extra_encode_flags: str = "",
+    smooth_filter: str = "none",   # "none", "hqdn3d", or "deflicker"
+) -> list[str]:
+    """Build the FFmpeg command list for RIFE frame interpolation.
+
+    2xfps mode:  dual-input trick — the input file is passed to FFmpeg twice.
+                 [0:v] feeds the original-frames branch (fast, passthrough).
+                 [1:v] feeds the DNN branch (slow, OpenVINO).
+                 Two independent decoders mean interleave is never starved:
+                 it pulls from the fast branch at its own pace and from the
+                 DNN branch as slowly as inference requires — no split filter,
+                 no fifo (removed in n6+), no queue overflow, no blank frames.
+    Midpoints:   simple dnn_processing filter (outputs only interpolated frames).
+
+    src_fps must be the actual source frame rate (e.g. 25.0, 29.97, 30.0).
+    It is embedded as a literal in the setpts expression because dnn_processing
+    does not propagate frame_rate to its output link (FRAME_RATE would be 0).
+    """
+    dnn_opts = (
+        f"dnn_backend=ivsr"
+        f":model={model_path}"
+        f":input=input"
+        f":output=output"
+        f":nireq={nireq}"
+        f":num_streams={num_streams}"
+        f":device={device}"
+        f":model_type=5"
+        f":normalize_factor=1.0"
+    )
+
+    if mode == "2xfps":
+        # Complex filtergraph: split → RIFE branch → shift timestamps → interleave
+        # Must use -filter_complex (not -vf) for labeled pads; label final output [outv]
+        #
+        # PTS strategy (three-stage):
+        #
+        # Stage 1 — setpts=PTS-STARTPTS before split
+        #   Normalises source PTS to start at 0.  Eliminates non-zero start PTS
+        #   and any container offset that would corrupt the downstream math.
+        #
+        # Stage 2 — setpts=PTS+{half}/TB on the RIFE stream
+        #   Shifts each interpolated frame forward by exactly half a frame period
+        #   IN SECONDS (half = 1/(2*fps), e.g. 0.02s for 25fps).
+        #   Dividing by TB converts seconds → timebase units correctly regardless
+        #   of what timebase dnn_processing sets on its output link.
+        #   This is safer than 1/(2*fps*TB) because TB in that expression can
+        #   evaluate to 1 inside certain filter contexts, shifting by only
+        #   1 clock tick (0.000078s) instead of the intended 0.02s — the
+        #   exact bug that produced the (0.000000, 0.000078, 0.080000, …) pattern.
+        #
+        # Stage 3 — setpts=N/(out_fps*TB) + fps=out_fps AFTER interleave
+        #   Re-indexes the merged stream so frame 0→0, frame 1→1/out_fps, …
+        #   This ignores all previous PTS and produces a perfectly linear
+        #   timeline.  fps= is the final conformer for the container header.
+        out_fps_val = 2.0 * src_fps
+        out_fps_str = str(int(out_fps_val)) if out_fps_val == int(out_fps_val) else f"{out_fps_val:.6g}"
+        pad_w = align_to_128(target_w)
+        pad_h = align_to_128(target_h)
+        fc = (
+            f"[0:v]scale={target_w}:{target_h},format=rgb24,"
+            f"pad={pad_w}:{pad_h}:0:0,crop={target_w}:{target_h},"
+            f"setpts=2*N[orig];"
+            f"[1:v]scale={target_w}:{target_h},format=rgb24,"
+            f"pad={pad_w}:{pad_h}:0:0,"
+            f"dnn_processing={dnn_opts},crop={target_w}:{target_h},"
+            f"setpts=2*N+1[dnn_out];"
+            f"[orig][dnn_out]interleave=nb_inputs=2:duration=longest,"
+            f"setpts=N/({out_fps_str}*TB),"
+            f"fps={out_fps_str}[outv]"
+        )
+        cmd = [ffmpeg_bin, "-y", "-i", input_video, "-i", input_video,
+               "-filter_complex", fc]
+        cmd += ["-map", "[outv]", "-map", "0:a?", "-c:a", "copy"]
+    else:
+        # dnn_processing does not propagate frame_rate (FRAME_RATE == 0 on its
+        # output link), so PTS from the filter are irregular.  Reset them to a
+        # strictly uniform sequence: frame N → N/fps seconds.  Without this the
+        # encoder receives uneven timestamps and the browser player jitters.
+        # Optional post-smooth filter:
+        #   hqdn3d=0:0:4:3  — temporal-only denoise; each pixel is averaged
+        #                     across time, smoothing the spatial wobble/wave
+        #                     caused by independent RIFE optical-flow errors.
+        #   deflicker       — normalises per-frame luminance; only helps with
+        #                     brightness flicker, not spatial ripple.
+        if smooth_filter == "hqdn3d":
+            _smooth = ",hqdn3d=0:0:4:3"
+        elif smooth_filter == "deflicker":
+            _smooth = ",deflicker"
+        else:
+            _smooth = ""
+        pad_w = align_to_128(target_w)
+        pad_h = align_to_128(target_h)
+        fc = (
+            f"scale={target_w}:{target_h},"
+            f"format=rgb24,"
+            f"pad={pad_w}:{pad_h}:0:0,"
+            f"dnn_processing={dnn_opts},"
+            f"crop={target_w}:{target_h},"
+            f"setpts=N/({src_fps}*TB),"
+            f"fps={src_fps}"
+            f"{_smooth}[outv]"
+        )
+        cmd = [ffmpeg_bin, "-y", "-i", input_video, "-filter_complex", fc]
+        cmd += ["-map", "[outv]", "-map", "0:a?", "-c:a", "copy"]
+
+    cmd += ["-pix_fmt", "yuv420p"]
+    # Disable B-frames so DTS == PTS for every frame.
+    # B-frame reordering causes HTML5 players (Streamlit st.video) to decode
+    # frames out of display order, producing visible "shaking" / jitter.
+    cmd += ["-bf", "0"]
+    if extra_encode_flags:
+        cmd += extra_encode_flags.split()
     cmd.append(output_video)
     return cmd
 
@@ -565,7 +701,7 @@ with st.sidebar:
     st.caption("Source: [github.com/OpenVisualCloud/iVSR](https://github.com/OpenVisualCloud/iVSR)")
 
 # ── Main tabs ─────────────────────────────────────────────────────────────────
-tab_vsr, tab_svp = st.tabs(["📺 Video Super Resolution (VSR)", "🗜️ Smart Video Processing (SVP)"])
+tab_vsr, tab_svp, tab_rife = st.tabs(["📺 Video Super Resolution (VSR)", "🗜️ Smart Video Processing (SVP)", "🎞️ Frame Interpolation (RIFE)"])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -994,6 +1130,373 @@ with tab_svp:
                     file_name="svp_output.mp4",
                     mime="video/mp4",
                     key="svp_download",
+                )
+            else:
+                st.warning("Output file not found.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 3 — RIFE Frame Interpolation
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_rife:
+    st.subheader("RIFE Frame Interpolation")
+    st.markdown(
+        "Double the frame rate of a video (e.g. 30 fps → 60 fps) using the "
+        "**RIFE** (Real-time Intermediate Flow Estimation) model. "
+        "Generates a temporally interpolated frame between each pair of originals."
+    )
+
+    st.info(
+        "**RIFE model constraints**  \n"
+        "- Input tensor: `[1, 6, H, W]` — two RGB frames packed channel-wise (NCHW float32)  \n"
+        "- Width and Height are **automatically padded** to the nearest multiple of 128 and cropped back — no manual alignment needed  \n"
+        "- Input pixels are normalised **0–255 → [0.0, 1.0]** automatically in the C backend  \n"
+        "- model_type `5` · nif `2` (fixed) · normalize_factor `1.0` (fixed)  \n"
+        "- **2x FPS mode**: original frames are preserved; one interpolated frame is "
+        "inserted between each pair → 2× frame count  \n"
+        "- **Midpoints-only mode**: only the interpolated frames are emitted (same frame count, "
+        "lower sharpness — useful for inspection)"
+    )
+
+    st.markdown("---")
+
+    # ── Model upload ──────────────────────────────────────────────────────────
+    st.markdown("#### Model")
+
+    rife_default_exists = os.path.isfile(DEFAULT_RIFE_MODEL)
+    col_xl, col_bin = st.columns(2)
+    with col_xl:
+        rife_xml_file = st.file_uploader(
+            "Upload RIFE Model (.xml)",
+            type=["xml"],
+            key="rife_xml_upload",
+            help="OpenVINO IR model XML file for RIFE.",
+        )
+    with col_bin:
+        rife_bin_file = st.file_uploader(
+            "Upload RIFE Weights (.bin)",
+            type=["bin"],
+            key="rife_bin_upload",
+            help="OpenVINO IR binary weights. Must match the .xml.",
+        )
+    rife_model_path = save_model_uploads(rife_xml_file, rife_bin_file, "rife")
+
+    if not rife_model_path:
+        if rife_default_exists:
+            use_default_rife = st.checkbox(
+                f"Use default RIFE model  (`{DEFAULT_RIFE_MODEL}`)",
+                value=True,
+                key="rife_use_default",
+            )
+            if use_default_rife:
+                rife_model_path = DEFAULT_RIFE_MODEL
+        else:
+            pass
+
+    st.markdown("---")
+
+    # ── Input video ───────────────────────────────────────────────────────────
+    st.markdown("#### Input Video")
+    rife_video_file = st.file_uploader(
+        "Upload Input Video",
+        type=["mp4", "mkv", "avi", "mov", "webm", "ts"],
+        key="rife_video_upload",
+    )
+    rife_input_video = save_upload(rife_video_file, ".mp4", "rife_video")
+    rife_output_video = os.path.join(tempfile.gettempdir(), "ivsr_rife_output.mp4")
+
+    _rife_src_info: dict = {}
+    if rife_input_video:
+        _rife_src_info = probe_video(rife_input_video, ffmpeg_bin)
+        st.caption(
+            f"Source: **{_rife_src_info['width']}x{_rife_src_info['height']}** · "
+            f"**{_rife_src_info['fps']} fps** · **{_rife_src_info['nb_frames']} frames** · "
+            f"{int(_rife_src_info['duration'] // 60)}m {_rife_src_info['duration'] % 60:.1f}s"
+        )
+
+    st.markdown("---")
+
+    # ── Scale (128-aligned) ───────────────────────────────────────────────────
+    st.markdown("#### Scale (must be multiples of 128)")
+
+    _def_w = _rife_src_info["width"] if _rife_src_info.get("width") else 640
+    _def_h = _rife_src_info["height"] if _rife_src_info.get("height") else 512
+
+    col_w, col_h = st.columns(2)
+    with col_w:
+        rife_w = st.number_input(
+            "Target Width",
+            min_value=2,
+            max_value=7680,
+            value=_def_w,
+            step=2,
+            key="rife_width",
+            help="Desired output width. Automatically padded to the next multiple of 128 for model input and cropped back.",
+        )
+    with col_h:
+        rife_h = st.number_input(
+            "Target Height",
+            min_value=2,
+            max_value=4320,
+            value=_def_h,
+            step=2,
+            key="rife_height",
+            help="Desired output height. Automatically padded to the next multiple of 128 for model input and cropped back.",
+        )
+
+    aligned_w = align_to_128(int(rife_w))
+    aligned_h = align_to_128(int(rife_h))
+    if aligned_w != int(rife_w) or aligned_h != int(rife_h):
+        st.caption(
+            f"Output: **{int(rife_w)}x{int(rife_h)}** — padded to **{aligned_w}x{aligned_h}** "
+            f"for model input, cropped back after inference."
+        )
+    else:
+        st.caption(f"Output: **{int(rife_w)}x{int(rife_h)}** (already 128-aligned — no padding needed)")
+
+    st.markdown("---")
+
+    # ── Output mode ───────────────────────────────────────────────────────────
+    st.markdown("#### Output Mode")
+    rife_mode_label = st.radio(
+        "Mode",
+        ["2x FPS - originals + interpolated (recommended)", "Midpoints only"],
+        index=0,
+        key="rife_mode",
+        help=(
+            "2x FPS: keeps all original frames and inserts one interpolated frame "
+            "between each pair, resulting in 2x frame count with full sharpness on originals.  "
+            "Midpoints only: emits only the RIFE-generated frames. Used for "
+            "debugging or special effects."
+        ),
+    )
+    rife_mode = "2xfps" if rife_mode_label.startswith("2x FPS") else "midpoints"
+
+    rife_smooth_filter = "none"
+    if rife_mode == "midpoints":
+        rife_smooth_filter = st.selectbox(
+            "Post-processing smooth filter",
+            ["none", "hqdn3d (temporal denoise — fixes spatial wave/ripple)", "deflicker (fixes luminance flicker)"],
+            index=1,
+            key="rife_smooth_filter",
+            help=(
+                "**hqdn3d**: averages each pixel across neighbouring frames in time — "
+                "best for the spatial wobble/wave caused by independent RIFE optical-flow errors.  \n"
+                "**deflicker**: normalises per-frame brightness — only helps with luminance flicker.  \n"
+                "**none**: no post-processing."
+            ),
+        )
+        # Extract the key before the first space/parenthesis
+        rife_smooth_filter = rife_smooth_filter.split()[0]
+
+    st.markdown("---")
+
+    # ── Inference parameters ──────────────────────────────────────────────────
+    st.markdown("#### Inference Parameters")
+
+    col_d, col_nr, col_ns = st.columns(3)
+    with col_d:
+        rife_device = st.selectbox(
+            "Target Device",
+            DEVICE_OPTIONS,
+            index=0,
+            key="rife_device",
+            help="Hardware to run RIFE inference on.",
+        )
+    with col_nr:
+        rife_nireq = st.number_input(
+            "Inference Requests (nireq)",
+            min_value=1,
+            max_value=32,
+            value=1,
+            step=1,
+            key="rife_nireq",
+            help="Number of parallel OpenVINO inference requests.",
+        )
+    with col_ns:
+        _rife_gpu = rife_device.startswith("GPU") or rife_device in ("MULTI:GPU.0,GPU.1", "AUTO")
+        rife_num_streams = st.number_input(
+            "GPU Streams (num_streams)",
+            min_value=1,
+            max_value=16,
+            value=1,
+            step=1,
+            disabled=not _rife_gpu,
+            key="rife_num_streams",
+            help="Throughput streams for GPU only.",
+        )
+
+    st.caption(
+        "**nif (filter):** 1 *(RIFE backend manages its own 2-frame sliding window internally)* | "
+        "**normalize_factor:** 1.0 *(fixed)* | **model_type:** 5"
+    )
+
+    # ── Encoding options ──────────────────────────────────────────────────────
+    with st.expander("Encoding Options"):
+        col_enc1, col_enc2 = st.columns(2)
+        with col_enc1:
+            rife_codec = st.selectbox(
+                "Output Codec",
+                ["libx264", "libx265", "copy"],
+                index=0,
+                key="rife_codec",
+                help="Encoder for the output video.",
+            )
+        with col_enc2:
+            rife_crf = st.slider(
+                "CRF (quality, lower=better)",
+                min_value=0,
+                max_value=51,
+                value=23,
+                key="rife_crf",
+                help="Constant Rate Factor.",
+            )
+        rife_encode_flags = (
+            f"-c:v {rife_codec} -crf {rife_crf}" if rife_codec != "copy" else "-c:v copy"
+        )
+
+    # ── Generated command preview ─────────────────────────────────────────────
+    if rife_model_path and rife_input_video:
+        st.markdown("---")
+        _rife_preview_cmd = build_rife_ffmpeg_cmd(
+            ffmpeg_bin=ffmpeg_bin,
+            input_video=rife_input_video,
+            output_video=rife_output_video,
+            model_path=rife_model_path,
+            target_w=int(rife_w),
+            target_h=int(rife_h),
+            device=rife_device,
+            nireq=int(rife_nireq),
+            num_streams=int(rife_num_streams),
+            mode=rife_mode,
+            src_fps=float(_rife_src_info.get("fps") or 25.0),
+            extra_encode_flags=rife_encode_flags,
+            smooth_filter=rife_smooth_filter,
+        )
+        with st.expander("Generated FFmpeg Command", expanded=True):
+            st.code(cmd_to_display_string(_rife_preview_cmd), language="bash")
+
+    # ── Run button ────────────────────────────────────────────────────────────
+    rife_run = st.button("Run RIFE Interpolation", key="rife_run")
+    if rife_run:
+        errors = []
+        if not rife_model_path:
+            errors.append("Upload a RIFE model (.xml + .bin) or enable the default model above.")
+        if not rife_input_video:
+            errors.append("Upload an input video file.")
+
+        if errors:
+            for e in errors:
+                st.error(e)
+        else:
+            _rife_run_cmd = build_rife_ffmpeg_cmd(
+                ffmpeg_bin=ffmpeg_bin,
+                input_video=rife_input_video,
+                output_video=rife_output_video,
+                model_path=rife_model_path,
+                target_w=int(rife_w),
+                target_h=int(rife_h),
+                device=rife_device,
+                nireq=int(rife_nireq),
+                num_streams=int(rife_num_streams),
+                mode=rife_mode,
+                src_fps=float(_rife_src_info.get("fps") or 25.0),
+                extra_encode_flags=rife_encode_flags,
+                smooth_filter=rife_smooth_filter,
+            )
+            _rife_probe = probe_video(rife_input_video, ffmpeg_bin)
+            _rife_src_frames = (
+                int(_rife_probe["nb_frames"])
+                if str(_rife_probe["nb_frames"]).isdigit() else 0
+            )
+            _rife_expected = _rife_src_frames * 2 if rife_mode == "2xfps" else _rife_src_frames
+            rife_status = st.empty()
+            with st.spinner("Running RIFE frame interpolation..."):
+                rife_rc, rife_stderr, rife_elapsed = run_ffmpeg(
+                    _rife_run_cmd, rife_status, total_frames=_rife_expected
+                )
+            rife_status.empty()
+
+            if rife_rc == 0:
+                with st.spinner("Optimising output for playback..."):
+                    apply_faststart(rife_output_video, ffmpeg_bin)
+                in_info = probe_video(rife_input_video, ffmpeg_bin)
+                out_info = probe_video(rife_output_video, ffmpeg_bin)
+                throughput = (
+                    round(int(out_info["nb_frames"]) / rife_elapsed, 1)
+                    if str(out_info.get("nb_frames", "N/A")).isdigit() else None
+                )
+                st.session_state["rife_result"] = {
+                    "output": rife_output_video,
+                    "input": rife_input_video,
+                    "elapsed": rife_elapsed,
+                    "in_info": in_info,
+                    "out_info": out_info,
+                    "throughput": throughput,
+                    "mode": rife_mode,
+                }
+            else:
+                st.session_state.pop("rife_result", None)
+                st.error(f"FFmpeg failed (exit code {rife_rc})")
+                with st.expander("FFmpeg stderr"):
+                    st.code(rife_stderr, language="text")
+
+    # ── Results ───────────────────────────────────────────────────────────────
+    if "rife_result" in st.session_state:
+        res = st.session_state["rife_result"]
+        ii = res.get("in_info", {})
+        oi = res.get("out_info", {})
+        mode_label = (
+            "2x FPS (original + interpolated)"
+            if res.get("mode") == "2xfps" else "midpoints only"
+        )
+        tp_str = f" | Throughput: {res['throughput']} fps" if res.get("throughput") else ""
+        st.success(f"Done in **{res['elapsed']:.1f}s**{tp_str}")
+
+        res_str  = lambda w, h: f"{w}x{h}" if w else "N/A"
+        size_str = lambda s: f"{s / 1024 / 1024:.1f} MB" if s else "N/A"
+        dur_str  = lambda d: f"{int(d // 60)}m {d % 60:.1f}s" if d else "N/A"
+        fps_str  = lambda f: f"{f} fps" if f else "N/A"
+
+        in_frames  = ii.get("nb_frames", "N/A")
+        out_frames = oi.get("nb_frames", "N/A")
+        in_fps     = ii.get("fps", 0)
+        out_fps    = oi.get("fps", 0)
+
+        col_in, col_out = st.columns(2)
+        with col_in:
+            st.markdown("**Input Video**")
+            st.video(make_preview(res["input"], ffmpeg_bin))
+            stats_block(
+                stat("Resolution", res_str(ii.get("width"), ii.get("height"))),
+                stat("Frame Rate", fps_str(in_fps)),
+                stat("Frames",     str(in_frames)),
+                stat("File Size",  size_str(ii.get("size", 0))),
+                stat("Duration",   dur_str(ii.get("duration", 0))),
+            )
+        with col_out:
+            st.markdown(f"**Output Video ({mode_label})**")
+            if os.path.isfile(res["output"]):
+                st.video(res["output"])
+                fps_delta = ""
+                if in_fps and out_fps and out_fps > in_fps:
+                    fps_delta = f"+{round(out_fps - in_fps, 2)} fps"
+                frames_delta = ""
+                if str(in_frames).isdigit() and str(out_frames).isdigit():
+                    frames_delta = f"+{int(out_frames) - int(in_frames)}"
+                stats_block(
+                    stat("Resolution", res_str(oi.get("width"), oi.get("height"))),
+                    stat("Frame Rate", fps_str(out_fps), fps_delta),
+                    stat("Frames",     str(out_frames), frames_delta),
+                    stat("File Size",  size_str(oi.get("size", 0))),
+                    stat("Duration",   dur_str(oi.get("duration", 0))),
+                )
+                st.download_button(
+                    "Download Output",
+                    data=open(res["output"], "rb").read(),
+                    file_name="rife_output.mp4",
+                    mime="video/mp4",
+                    key="rife_download",
                 )
             else:
                 st.warning("Output file not found.")

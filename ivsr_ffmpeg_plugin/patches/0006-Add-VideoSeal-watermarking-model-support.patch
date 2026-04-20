@@ -1,0 +1,725 @@
+--- a/libavfilter/dnn/dnn_backend_ivsr.c	2026-04-17 06:27:37.076000000 +0000
++++ b/libavfilter/dnn/dnn_backend_ivsr.c	2026-04-17 08:05:41.784000000 +0000
+@@ -50,6 +50,7 @@
+     CUSTVSR,
+     TSENET,
+     RIFE,          // frame interpolation (nif=2, 6-ch input)
++    VIDEOSEAL,     // invisible watermarking (nif=1, 3-ch input, baked payload)
+     MODEL_TYPE_NUM
+ } ModelType;
+ 
+@@ -90,6 +91,80 @@
+ 
+ #define ALIGNED_SIZE 64
+ 
++/* ---------------------------------------------------------------------------
++ * ModelDesc — per-model descriptor table
++ *
++ * To add a new model:
++ *   1. Add an enum value to ModelType (above).
++ *   2. Add a row to model_table[] (below) — fill in the static fields.
++ *   3. If the model needs non-generic input packing or output unpacking,
++ *      write static pack_input_<name> / unpack_output_<name> functions
++ *      (see RIFE / VideoSeal below as templates) and point the function
++ *      pointers at them.  If the generic NCHW-float or ff_proc paths work,
++ *      leave the pointers NULL.
++ *
++ * That is the ONLY change needed — no if/else chains anywhere else.
++ * ---------------------------------------------------------------------------
++ *
++ * Field reference:
++ *   name            human-readable label (for log messages)
++ *   nif_override    force nif to this value (0 = use SDK-reported value)
++ *   channel_divisor channels reported to filter = actual_channels / divisor
++ *                   (RIFE has [1,6,H,W] input but each frame is 3-ch → /2;
++ *                    TSENET has 3× stacked frames → /3; others → 1)
++ *   align           input W/H round-up alignment in pixels (0 = none)
++ *   in_layout       tensor layout string for iVSR SDK ("NHWC","NCHW","NFHWC")
++ *   in_precision    tensor element type ("u8","u16","f32"; NULL = depth-derived)
++ *   out_layout      output tensor layout string
++ *   out_precision   output element type (NULL = default "fp32")
++ *   model_color     model colour-space string ("RGB","I420_Three_Planes",NULL)
++ *   out_order       DNNColorOrder for output.order assignment
++ *   pack_input      custom rgb24→tensor function; NULL = generic ff_proc path
++ *   unpack_output   custom tensor→rgb24 function; NULL = generic ff_proc path
++ * ---------------------------------------------------------------------------
++ */
++typedef struct IVSRModel IVSRModel; /* forward decl for function pointer types */
++typedef int  (*PackInputFn)  (IVSRModel *m, void *in_data_base,
++                               DNNData *input, TaskItem *task);
++typedef void (*UnpackOutputFn)(IVSRModel *m, TaskItem *task,
++                               DNNData *output);
++
++typedef struct ModelDesc {
++    const char     *name;
++    int             nif_override;
++    int             channel_divisor;
++    int             align;
++    const char     *in_layout;
++    const char     *in_precision;   /* NULL = derive from bit-depth */
++    const char     *out_layout;
++    const char     *out_precision;  /* NULL = default "fp32" */
++    const char     *model_color;    /* NULL = handled in VIDEOPROC/CUSTVSR branch */
++    DNNColorOrder   out_order;
++    PackInputFn     pack_input;     /* NULL = generic path */
++    UnpackOutputFn  unpack_output;  /* NULL = generic path */
++} ModelDesc;
++
++/* ---- forward declarations for the per-model I/O functions ---- */
++static int  pack_input_rife     (IVSRModel *m, void *base, DNNData *in, TaskItem *t);
++static void unpack_output_rife  (IVSRModel *m, TaskItem *t, DNNData *out);
++static int  pack_input_videoseal(IVSRModel *m, void *base, DNNData *in, TaskItem *t);
++static void unpack_output_videoseal(IVSRModel *m, TaskItem *t, DNNData *out);
++
++/* ---- The descriptor table — one row per ModelType enum value ---- */
++static const ModelDesc model_table[] = {
++    /* [BASICVSR]  */ { "BasicVSR",  0, 1, 32,   "NFHWC", NULL,  "NFHWC", NULL,   "RGB",                DCO_RGB,  NULL, NULL },
++    /* [VIDEOPROC] */ { "VideoProc", 0, 1, ALIGNED_SIZE, "NHWC", NULL, "NHWC", NULL, NULL,               DCO_RGB,  NULL, NULL },
++    /* [EDSR]      */ { "EDSR",      0, 1, 0,    "NHWC",  NULL,  "NHWC",  NULL,   "RGB",                DCO_RGB,  NULL, NULL },
++    /* [CUSTVSR]   */ { "CustVSR",   0, 1, ALIGNED_SIZE, "NHWC", NULL, "NHWC", NULL, NULL,              DCO_NONE, NULL, NULL },
++    /* [TSENET]    */ { "TSENet",    3, 3, 0,    "NCHW",  NULL,  "NHWC",  NULL,   "RGB",                DCO_RGB,  NULL, NULL },
++    /* [RIFE]      */ { "RIFE",      2, 2, 128,  "NCHW",  "f32", "NCHW",  "fp32", "RGB",                DCO_RGB,  pack_input_rife,      unpack_output_rife      },
++    /* [VIDEOSEAL] */ { "VideoSeal", 1, 1, 0,    "NCHW",  "f32", "NCHW",  "fp32", "RGB",                DCO_RGB,  pack_input_videoseal, unpack_output_videoseal },
++};
++av_unused static void model_table_size_check(void) {
++    /* Compile-time assert: table has exactly MODEL_TYPE_NUM entries */
++    typedef char model_table_wrong_size[(sizeof(model_table)/sizeof(model_table[0]) == MODEL_TYPE_NUM) ? 1 : -1];
++}
++
+ static int get_datatype_size(DNNDataType dt)
+ {
+     switch (dt) {
+@@ -267,6 +342,138 @@
+     }
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * Per-model input packing and output unpacking functions
++ *
++ * Signature:
++ *   pack_input   – returns 0 on success, DNN_MORE_FRAMES, or AVERROR(*).
++ *                  Sets input->data back to base before returning on success.
++ *   unpack_output – writes directly into task->out_frame->data[0].
++ *
++ * Generic path (NULL function pointer): ff_proc_from_frame_to_dnn /
++ * ff_proc_from_dnn_to_frame with optional NCHW↔NHWC conversion.
++ * ---------------------------------------------------------------------------
++ */
++
++/* RIFE: sliding window of 2 frames; input is [0,1] float32 NCHW. */
++static int pack_input_rife(IVSRModel *m, void *base, DNNData *input, TaskItem *task)
++{
++    AVFrame *tmp_frame = av_frame_alloc();
++    if (av_frame_ref(tmp_frame, task->in_frame) < 0)
++        return AVERROR(ENOMEM);
++    av_fifo_write(m->frame_queue, &tmp_frame, 1);
++
++    if (av_fifo_can_read(m->frame_queue) < (size_t)m->nif)
++        return DNN_MORE_FRAMES;
++
++    av_assert0(av_fifo_can_read(m->frame_queue) == (size_t)m->nif);
++    AVFrame **frames = av_mallocz(sizeof(AVFrame *) * m->nif);
++    if (!frames)
++        return AVERROR(ENOMEM);
++    av_fifo_peek(m->frame_queue, frames, m->nif, 0);
++
++    for (int idx = 0; idx < m->nif; idx++) {
++        AVFrame *frame = frames[idx];
++        float *dst = (float *)input->data;
++        int w  = input->width, h = input->height;
++        int ps = w * h;
++        for (int y = 0; y < h; y++) {
++            uint8_t *row = frame->data[0] + y * frame->linesize[0];
++            for (int x = 0; x < w; x++) {
++                dst[0 * ps + y * w + x] = row[x * 3 + 0] / 255.0f;
++                dst[1 * ps + y * w + x] = row[x * 3 + 1] / 255.0f;
++                dst[2 * ps + y * w + x] = row[x * 3 + 2] / 255.0f;
++            }
++        }
++        input->data += ps * 3 * sizeof(float);
++    }
++    input->data = base;
++    av_freep(&frames);
++
++    /* Slide window: pop oldest frame */
++    av_fifo_read(m->frame_queue, &tmp_frame, 1);
++    av_frame_unref(tmp_frame);
++    av_frame_free(&tmp_frame);
++    return 0;
++}
++
++/* RIFE: output is [0,1] float32 NCHW → rgb24. */
++static void unpack_output_rife(IVSRModel *m, TaskItem *task, DNNData *output)
++{
++    (void)m;
++    const float *src = (const float *)output->data;
++    int fw = task->out_frame->width, fh = task->out_frame->height;
++    for (int h = 0; h < fh; h++) {
++        uint8_t *row = task->out_frame->data[0] + h * task->out_frame->linesize[0];
++        for (int w = 0; w < fw; w++) {
++            float r, g, b;
++            if (output->layout == DL_NCHW) {
++                int ps = output->height * output->width;
++                r = src[0 * ps + h * output->width + w];
++                g = src[1 * ps + h * output->width + w];
++                b = src[2 * ps + h * output->width + w];
++            } else {
++                int base = (h * output->width + w) * 3;
++                r = src[base + 0]; g = src[base + 1]; b = src[base + 2];
++            }
++            row[w * 3 + 0] = (uint8_t)av_clip((int)(r * 255.0f + 0.5f), 0, 255);
++            row[w * 3 + 1] = (uint8_t)av_clip((int)(g * 255.0f + 0.5f), 0, 255);
++            row[w * 3 + 2] = (uint8_t)av_clip((int)(b * 255.0f + 0.5f), 0, 255);
++        }
++    }
++}
++
++/* VideoSeal: single frame; input is raw [0,255] float32 NCHW (no /255 — baked in model). */
++static int pack_input_videoseal(IVSRModel *m, void *base, DNNData *input, TaskItem *task)
++{
++    (void)m;
++    AVFrame *frame = task->in_frame;
++    float *dst = (float *)input->data;
++    int vw = input->width, vh = input->height;
++    int ps = vw * vh;
++    for (int y = 0; y < vh; y++) {
++        uint8_t *row = frame->data[0] + y * frame->linesize[0];
++        for (int x = 0; x < vw; x++) {
++            dst[0 * ps + y * vw + x] = (float)row[x * 3 + 0];
++            dst[1 * ps + y * vw + x] = (float)row[x * 3 + 1];
++            dst[2 * ps + y * vw + x] = (float)row[x * 3 + 2];
++        }
++    }
++    input->data = base;
++    return 0;
++}
++
++/* VideoSeal: output is [0,255] float32 NCHW → rgb24 (model already scaled by 255). */
++static void unpack_output_videoseal(IVSRModel *m, TaskItem *task, DNNData *output)
++{
++    (void)m;
++    const float *src = (const float *)output->data;
++    int fw = task->out_frame->width, fh = task->out_frame->height;
++    for (int h = 0; h < fh; h++) {
++        uint8_t *row = task->out_frame->data[0] + h * task->out_frame->linesize[0];
++        for (int w = 0; w < fw; w++) {
++            float r, g, b;
++            if (output->layout == DL_NCHW) {
++                int ps = output->height * output->width;
++                r = src[0 * ps + h * output->width + w];
++                g = src[1 * ps + h * output->width + w];
++                b = src[2 * ps + h * output->width + w];
++            } else {
++                int base = (h * output->width + w) * 3;
++                r = src[base + 0]; g = src[base + 1]; b = src[base + 2];
++            }
++            row[w * 3 + 0] = (uint8_t)av_clip((int)(r + 0.5f), 0, 255);
++            row[w * 3 + 1] = (uint8_t)av_clip((int)(g + 0.5f), 0, 255);
++            row[w * 3 + 2] = (uint8_t)av_clip((int)(b + 0.5f), 0, 255);
++        }
++    }
++}
++
++/* ---------------------------------------------------------------------------
++ * End of per-model I/O functions
++ * ---------------------------------------------------------------------------
++ */
++
+ /* returns
+  *     DNN_GENERIC_ERROR,
+  *     DNN_MORE_FRAMES - waiting for more input frames,
+@@ -301,15 +508,13 @@
+     }
+ 
+     set_dnndata_info(&input, &input_tensor_desc_get);
+-    if (ivsr_model->model_type == TSENET) {
+-        input.dims[dnn_get_channel_idx_by_layout(input.layout)] /= 3;
+-        input.channels = input.channels / 3;
+-    } else if (ivsr_model->model_type == RIFE) {
+-        /* RIFE input tensor has nif*3 channels (e.g. 6 = 2 frames × 3 RGB).
+-         * Divide by nif so that each ff_proc_from_frame_to_dnn call fills
+-         * exactly one frame-worth of channels. */
+-        input.dims[dnn_get_channel_idx_by_layout(input.layout)] /= ivsr_model->nif;
+-        input.channels = input.channels / ivsr_model->nif;
++    /* Apply channel divisor from model descriptor (e.g. RIFE /2, TSENET /3). */
++    {
++        int div = model_table[ivsr_model->model_type].channel_divisor;
++        if (div > 1) {
++            input.dims[dnn_get_channel_idx_by_layout(input.layout)] /= div;
++            input.channels /= div;
++        }
+     }
+ 
+     input.data = request->in_frames;
+@@ -355,19 +560,19 @@
+                     }
+                     input.data = in_data;
+                 }
++                /* ---- Input packing: table-driven --------------------------------- */
+                 if (ivsr_model->model_type == BASICVSR && ivsr_model->nif != 1) {
++                    /* BasicVSR: read nif frames from the task's in_queue. */
+                     int read_frame_num = 0;
+                     for (int j = 0; j < ivsr_model->nif; j++) {
+                         if (av_fifo_can_read(task->in_queue)) {
+                             av_fifo_read(task->in_queue, &tmp_frame, 1);
+                             ff_proc_from_frame_to_dnn(tmp_frame, &input,
+                                                       ivsr_model->model.filter_ctx);
+-                            // convert buffer from NHWC to NCHW when C != 1
+-                            if (input.channels != 1 && input.layout == DL_NONE )
++                            if (input.channels != 1 && input.layout == DL_NONE)
+                                 convert_nhwc_to_nchw(input.data, 1, input.channels, input.height, input.width, input.dt);
+-                            input.data +=
+-                                input.height * input.width *
+-                                input.channels * get_datatype_size(input.dt);
++                            input.data += input.height * input.width *
++                                          input.channels * get_datatype_size(input.dt);
+                             read_frame_num++;
+                         }
+                     }
+@@ -377,117 +582,52 @@
+                                "Read frame number is %d less than the model requirement %d!!!\n",
+                                read_frame_num, ivsr_model->nif);
+                 } else if (ivsr_model->model_type == TSENET) {
+-                    //1. copy the input_frame(ref the buffer) and put into ivsr_model->fame_queue
++                    /* TSENet: sliding window of 3 frames via frame_queue. */
+                     tmp_frame = av_frame_alloc();
+-                    if(av_frame_ref(tmp_frame, task->in_frame) < 0) {
++                    if (av_frame_ref(tmp_frame, task->in_frame) < 0)
+                         return AVERROR(ENOMEM);
+-                    }
+-
+                     av_fifo_write(ivsr_model->frame_queue, &tmp_frame, 1);
+                     if (ivsr_model->tsenet_frame_num == 0) {
+-                        //For the first pic in the stream
+                         tmp_frame = av_frame_alloc();
+-                        if(av_frame_ref(tmp_frame, task->in_frame) < 0) {
++                        if (av_frame_ref(tmp_frame, task->in_frame) < 0)
+                             return AVERROR(ENOMEM);
+-                        }
+                         av_fifo_write(ivsr_model->frame_queue, &tmp_frame, 1);
+                         ivsr_model->tsenet_frame_num++;
+                     }
+-                    //2. check if queue size is >= nif
+-                    if (av_fifo_can_read(ivsr_model->frame_queue) >= ivsr_model->nif) {
+-                        //2.1 prepare dnn data into request
+-                        av_assert0(av_fifo_can_read(ivsr_model->frame_queue) == ivsr_model->nif);
++                    if (av_fifo_can_read(ivsr_model->frame_queue) >= (size_t)ivsr_model->nif) {
++                        av_assert0(av_fifo_can_read(ivsr_model->frame_queue) == (size_t)ivsr_model->nif);
+                         AVFrame **input_frames = av_mallocz(sizeof(AVFrame *) * ivsr_model->nif);
+                         av_fifo_peek(ivsr_model->frame_queue, input_frames, ivsr_model->nif, 0);
+                         for (int idx = 0; idx < ivsr_model->nif; idx++) {
+-                            //INFO: the 3 frames in frame_queue are: (N-2)th, (N-1)th, (N)th
+                             ff_proc_from_frame_to_dnn(input_frames[idx], &input, ivsr_model->model.filter_ctx);
+-                            //NHWC->NCHW was processed in ff_proc_from_frame_to_dnn() if input.layout is set
+-                            if (input.channels != 1 && input.layout == DL_NONE )
++                            if (input.channels != 1 && input.layout == DL_NONE)
+                                 convert_nhwc_to_nchw(input.data, 1, input.channels, input.height, input.width, input.dt);
+                             input.data += input.height * input.width * input.channels * get_datatype_size(input.dt);
+                         }
+                         input.data = in_data;
+-                        //pop the (N-2)th frame from frame_queue and free it
+-                        av_fifo_read(ivsr_model->frame_queue, &tmp_frame, 1);
+-                        av_frame_unref(tmp_frame);
+-                        av_frame_free(&tmp_frame);
+-                        // INFO: for the last frame, peek_back and pop_front get the same frame, so don't have to handle EOS specifically
+-                    } else {
+-                        return DNN_MORE_FRAMES;
+-                    }
+-                } else if (ivsr_model->model_type == RIFE) {
+-                    // RIFE frame interpolation: sliding window of 2 consecutive frames.
+-                    // Input tensor: [1, 6, H, W] — frame(N-1) in channels 0-2, frame(N) in channels 3-5.
+-                    // Output tensor: [1, 3, H, W] — interpolated midpoint RIFE(f_{N-1}, f_N).
+-                    // The first frame returns DNN_MORE_FRAMES (no output); from the second frame
+-                    // onwards the output slot for f_{N-1} is filled with the midpoint.
+-                    // Pair with a split+interleave filter graph to produce 60fps from 30fps:
+-                    //   scale,format=rgb24,split[a][b];
+-                    //   [b]dnn_processing=...model_type=5[ri];
+-                    //   [ri]setpts=PTS+1/(2*FRAME_RATE*TB)[interp];
+-                    //   [a][interp]interleave=nb_inputs=2:duration=longest
+-                    tmp_frame = av_frame_alloc();
+-                    if (av_frame_ref(tmp_frame, task->in_frame) < 0)
+-                        return AVERROR(ENOMEM);
+-                    av_fifo_write(ivsr_model->frame_queue, &tmp_frame, 1);
+-                    if (av_fifo_can_read(ivsr_model->frame_queue) >= ivsr_model->nif) {
+-                        av_assert0(av_fifo_can_read(ivsr_model->frame_queue) == ivsr_model->nif);
+-                        AVFrame **input_frames = av_mallocz(sizeof(AVFrame *) * ivsr_model->nif);
+-                        if (!input_frames)
+-                            return AVERROR(ENOMEM);
+-                        av_fifo_peek(ivsr_model->frame_queue, input_frames, ivsr_model->nif, 0);
+-                        for (int idx = 0; idx < ivsr_model->nif; idx++) {
+-                            /* Bypass ff_proc_from_frame_to_dnn for RIFE entirely.
+-                             * sws_scale routes rgb24→DNN_FLOAT through GRAYF32 which:
+-                             *   (a) collapses RGB into a single luma channel, leaving
+-                             *       G and B planes zeroed — destroys color for optical flow.
+-                             *   (b) even when patched, produces values in [0, 255] not [0, 1].
+-                             * Instead, manually extract rgb24 pixels directly into the NCHW
+-                             * float tensor: R-plane, G-plane, B-plane each normalized to [0,1].
+-                             * This is identical to what the RIFE PyTorch pre-processing does. */
+-                            AVFrame *frame = input_frames[idx];
+-                            float *dst = (float *)input.data;
+-                            int w = input.width;
+-                            int h = input.height;
+-                            int ps = w * h; /* plane stride: one channel */
+-                            for (int y = 0; y < h; y++) {
+-                                uint8_t *row = frame->data[0] + y * frame->linesize[0];
+-                                for (int x = 0; x < w; x++) {
+-                                    dst[0 * ps + y * w + x] = row[x * 3 + 0] / 255.0f;
+-                                    dst[1 * ps + y * w + x] = row[x * 3 + 1] / 255.0f;
+-                                    dst[2 * ps + y * w + x] = row[x * 3 + 2] / 255.0f;
+-                                }
+-                            }
+-                            input.data += ps * 3 * sizeof(float);
+-                        }
+-                        input.data = in_data;
+-                        av_freep(&input_frames);
+-                        // Pop the oldest frame (N-1) to slide the window
+                         av_fifo_read(ivsr_model->frame_queue, &tmp_frame, 1);
+                         av_frame_unref(tmp_frame);
+                         av_frame_free(&tmp_frame);
+                     } else {
+                         return DNN_MORE_FRAMES;
+                     }
++                } else if (model_table[ivsr_model->model_type].pack_input != NULL) {
++                    /* Custom packing (e.g. RIFE, VideoSeal): delegate to descriptor. */
++                    int ret = model_table[ivsr_model->model_type].pack_input(
++                                    ivsr_model, in_data, &input, task);
++                    if (ret != 0)
++                        return ret;
+                 } else {
+-                    // ff_proc_from_frame_to_dnn will perform normalization by calling
+-                    // uint_y_to_float_y_wrapper in swscale_unscaled.c
+-                    // So, for the inputs do not need normalization, normalization facotr should be multiplied back.
+-                    // Same to ff_proc_from_dnn_to_frame.
++                    /* Generic path: ff_proc_from_frame_to_dnn + optional NCHW conversion. */
+                     ff_proc_from_frame_to_dnn(task->in_frame, &input,
+                                               ivsr_model->model.filter_ctx);
+-                    if (input.channels != 1 && (input.layout == DL_NONE)) {
++                    if (input.channels != 1 && input.layout == DL_NONE)
+                         convert_nhwc_to_nchw(input.data, 1, input.channels, input.height, input.width, input.dt);
+-                    }
+-
+                     if (normalize_factor != 1 && input.dt == DNN_FLOAT &&
+                         (fabsf(input.scale - 1.0f) > 1e-6f || fabsf(input.scale) < 1e-6f)) {
+-                        // do not need to covert buffer from NHWC to NCHW if the channels is 1, only need to mulitple normalize_factor
+                         #pragma omp parallel for
+-                        for (int pos = 0; pos < input.height * input.width * input.channels; pos++) {
+-                            ((float*)input.data)[pos] = ((float*)input.data)[pos] * normalize_factor;
+-                        }
++                        for (int pos = 0; pos < input.height * input.width * input.channels; pos++)
++                            ((float*)input.data)[pos] *= normalize_factor;
+                     }
+                 }
+             }
+@@ -542,20 +682,8 @@
+     // FIXME: Apt to make mistakes when changes are made here!
+     output.mean     = 0.0f;
+     output.scale    = output.dt == DNN_FLOAT ? 0.0f : 1.0f;
+-    // set order based on model type
+-    switch (ivsr_model->model_type)
+-    {
+-    case BASICVSR:
+-    case VIDEOPROC:
+-    case EDSR:
+-    case TSENET:
+-    case RIFE:          // interpolated frame is RGB, same conversion as above
+-        output.order = DCO_RGB;
+-        break;
+-    default:
+-        output.order = DCO_NONE;
+-        break;
+-    }
++    /* output.order from descriptor table */
++    output.order = model_table[ivsr_model->model_type].out_order;
+ 
+     const AVPixFmtDescriptor* pix_desc = av_pix_fmt_desc_get(task->out_frame->format);
+     const AVComponentDescriptor* comp_desc = &pix_desc->comp[0];
+@@ -598,89 +726,43 @@
+                         offset++;
+                     } while (offset != ivsr_model->nif);
+                 } else {
+-                    if (ivsr_model->model_type == RIFE && output.dt == DNN_FLOAT) {
+-                        /* RIFE output: float32 [0,1] → packed rgb24.
+-                         * Bypass ff_proc_from_dnn_to_frame entirely: its GRAYF32→GRAY8 sws
+-                         * trick applies luma range expansion (values compressed to [16,235])
+-                         * and cannot correctly handle multi-channel interleaved data, causing
+-                         * wave/mountain/colour artifacts regardless of layout.
+-                         * Handle both NCHW [1,3,H,W] and NHWC [1,H,W,3] directly.
+-                         * output.width/height are 128-aligned padded dims; only iterate
+-                         * over the actual frame dimensions to skip padding. */
+-                        const float *src = (const float *)output.data;
+-                        int fw = task->out_frame->width;
+-                        int fh = task->out_frame->height;
+-                        for (int h = 0; h < fh; h++) {
+-                            uint8_t *row = task->out_frame->data[0]
+-                                           + h * task->out_frame->linesize[0];
+-                            for (int w = 0; w < fw; w++) {
+-                                float r, g, b;
+-                                if (output.layout == DL_NCHW) {
+-                                    int ps = output.height * output.width; /* plane stride */
+-                                    r = src[0 * ps + h * output.width + w];
+-                                    g = src[1 * ps + h * output.width + w];
+-                                    b = src[2 * ps + h * output.width + w];
+-                                } else { /* NHWC or DL_NONE */
+-                                    int base = (h * output.width + w) * 3;
+-                                    r = src[base + 0];
+-                                    g = src[base + 1];
+-                                    b = src[base + 2];
+-                                }
+-                                row[w * 3 + 0] = (uint8_t)av_clip((int)(r * 255.0f + 0.5f), 0, 255);
+-                                row[w * 3 + 1] = (uint8_t)av_clip((int)(g * 255.0f + 0.5f), 0, 255);
+-                                row[w * 3 + 2] = (uint8_t)av_clip((int)(b * 255.0f + 0.5f), 0, 255);
+-                            }
+-                        }
++                    /* ---- Output unpacking: table-driven --------------------------- */
++                    if (model_table[ivsr_model->model_type].unpack_output != NULL) {
++                        /* Custom unpacking (e.g. RIFE, VideoSeal). */
++                        model_table[ivsr_model->model_type].unpack_output(
++                                ivsr_model, task, &output);
+                     } else {
+-                    if (output.channels != 1 && (output.layout == DL_NONE || output.layout == DL_NCHW)) {
+-                        //convert buffer from NCHW to NHWC
+-                        convert_nchw_to_nhwc(output.data, 1, output.channels, output.height, output.width, output.dt);
+-                        /* After the in-place NCHW→NHWC transpose the tensor is interleaved.
+-                         * Set layout to DL_NONE so ff_proc_from_dnn_to_frame takes the
+-                         * non-NCHW path (stride = dims[3]*3*sizeof(float) = W*12 which is
+-                         * the correct NHWC row stride).  dims[] stay in original NCHW order
+-                         * [N,C,H,W], so dims[3]=W gives the right per-row byte count for
+-                         * the sws_scale source stride. */
+-                        if (output.layout == DL_NCHW)
+-                            output.layout = DL_NONE;
+-                    }
+-
+-                    // For the outputs do not need normalization, normalization factor should be divided back. e.g. EDSR
+-                    if (normalize_factor != 1 && output.dt == DNN_FLOAT &&
+-                        (fabsf(output.scale - 1.0f) > 1e-6f || fabsf(output.scale) < 1e-6f)) {
+-                        #pragma omp parallel for
+-                        // only need to devide by normalize_factor for channels = 1.
+-                        for (int pos = 0; pos < output.height * output.width * output.channels; pos++) {
+-                            ((float*)output.data)[pos] = ((float*)output.data)[pos] / normalize_factor;
++                        /* Generic path: optional NCHW→NHWC, then ff_proc_from_dnn_to_frame. */
++                        if (output.channels != 1 && (output.layout == DL_NONE || output.layout == DL_NCHW)) {
++                            convert_nchw_to_nhwc(output.data, 1, output.channels, output.height, output.width, output.dt);
++                            if (output.layout == DL_NCHW)
++                                output.layout = DL_NONE;
+                         }
+-                    }
+-
+-                    ff_proc_from_dnn_to_frame(task->out_frame, &output,
+-                                              &ivsr_model->model.filter_ctx);
+-                    // clamp output to [16, 235] range for Y plane when color range of output is TV range,
+-                    // assume model only process Y plane when output.channels = 1. AVCOL_RANGE_MPEG is mean tv range.
+-                    if (task->out_frame->color_range == AVCOL_RANGE_MPEG && output.channels == 1) {
+-                        if (bits == 8) {
+-                            uint8_t min_x = 16, max_x = 235;
+-                            for (int index = 0; index < task->out_frame->height * task->out_frame->linesize[0];
+-                                 ++index) {
+-                                uint8_t value = task->out_frame->data[0][index];
+-                                task->out_frame->data[0][index] = (uint8_t)clamp(task->out_frame->data[0][index],
+-                                                                                 min_x, max_x);
+-                            }
+-                        } else if (bits == 10) {
+-                            uint16_t min_x = 64, max_x = 940;
+-                            uint16_t* dstPtr = (uint16_t*)task->out_frame->data[0];
+-                            ptrdiff_t dstStrideUint16 = task->out_frame->linesize[0] >> 1;
+-                            for (int y = 0; y < task->out_frame->height; ++y) {
+-                                for (int x = 0; x < task->out_frame->width; ++x) {
+-                                    dstPtr[x] = (uint16_t)clamp(dstPtr[x], min_x, max_x);
++                        if (normalize_factor != 1 && output.dt == DNN_FLOAT &&
++                            (fabsf(output.scale - 1.0f) > 1e-6f || fabsf(output.scale) < 1e-6f)) {
++                            #pragma omp parallel for
++                            for (int pos = 0; pos < output.height * output.width * output.channels; pos++)
++                                ((float*)output.data)[pos] /= normalize_factor;
++                        }
++                        ff_proc_from_dnn_to_frame(task->out_frame, &output,
++                                                  &ivsr_model->model.filter_ctx);
++                        if (task->out_frame->color_range == AVCOL_RANGE_MPEG && output.channels == 1) {
++                            if (bits == 8) {
++                                uint8_t min_x = 16, max_x = 235;
++                                for (int index = 0; index < task->out_frame->height * task->out_frame->linesize[0]; ++index)
++                                    task->out_frame->data[0][index] = (uint8_t)clamp(task->out_frame->data[0][index], min_x, max_x);
++                            } else if (bits == 10) {
++                                uint16_t min_x = 64, max_x = 940;
++                                uint16_t *dstPtr = (uint16_t *)task->out_frame->data[0];
++                                ptrdiff_t stride = task->out_frame->linesize[0] >> 1;
++                                for (int y = 0; y < task->out_frame->height; ++y) {
++                                    for (int x = 0; x < task->out_frame->width; ++x)
++                                        dstPtr[x] = (uint16_t)clamp(dstPtr[x], min_x, max_x);
++                                    dstPtr += stride;
+                                 }
+-                                dstPtr += dstStrideUint16;
+                             }
+                         }
+                     }
+-                    }
+                 }
+             }
+         } else {
+@@ -728,17 +810,14 @@
+     }
+ 
+     set_dnndata_info(input, &input_tensor_desc_get);
+-    if (ivsr_model->model_type == TSENET) {
+-        input->dims[dnn_get_channel_idx_by_layout(input->layout)] /= 3;
+-        input->channels /= 3;
+-    } else if (ivsr_model->model_type == RIFE) {
+-        /* RIFE model input is [1, 6, H, W]: two RGB frames stacked along
+-         * the channel axis.  Report 3 channels to the filter graph so that
+-         * each individual input frame (rgb24) is accepted. */
+-        input->dims[dnn_get_channel_idx_by_layout(input->layout)] /= 2;
+-        input->channels /= 2;
++    /* Apply channel divisor from descriptor (e.g. RIFE /2, TSENET /3). */
++    {
++        int div = model_table[ivsr_model->model_type].channel_divisor;
++        if (div > 1) {
++            input->dims[dnn_get_channel_idx_by_layout(input->layout)] /= div;
++            input->channels /= div;
++        }
+     }
+-
+     // hard code to pass check_modelinput_inlink() that requires DNN_FLOAT of model_input->dt
+     input->dt = DNN_FLOAT;
+ 
+@@ -997,31 +1076,18 @@
+             strcpy(output_tensor_desc_set.precision, "u16");
+         }
+     }
+-    // customize layout for Basic_VSR and TSENet
+-    if (ivsr_model->model_type == BASICVSR) {
+-        strcpy(input_tensor_desc_set.layout, "NFHWC");
+-        strcpy(output_tensor_desc_set.layout, "NFHWC");
+-    } else if (ivsr_model->model_type == TSENET) {
+-        //For TSENet, it's not typical N'C'HW, so do the NHWC->NCHW transion in plugin
+-        strcpy(input_tensor_desc_set.layout, "NCHW");
+-        if (desc->comp[0].depth == 8) {
+-            strcpy(input_tensor_desc_set.precision, "u8");
+-        } else if (desc->comp[0].depth == 10 || desc->comp[0].depth == 16) {
+-            strcpy(input_tensor_desc_set.precision, "u16");
+-        }
+-    } else if (ivsr_model->model_type == RIFE) {
+-        // RIFE model native format is NCHW [1, 6, H, W] input, [1, 3, H, W] output.
+-        // Use NCHW layout so that packing two frames sequentially is correct:
+-        // frame0 → channels 0-2, frame1 → channels 3-5 (each as a contiguous NCHW block).
+-        // NHWC would require per-pixel interleaving of 6 channels which the sequential
+-        // fill loop cannot produce.
+-        // The output must also be NCHW so that ff_proc_from_dnn_to_frame receives a planar
+-        // [R-plane, G-plane, B-plane] tensor rather than interleaved pixels; mismatching this
+-        // is the primary cause of the wavy/shaky artefacts in the interpolated frames.
+-        strcpy(input_tensor_desc_set.layout, "NCHW");
+-        strcpy(input_tensor_desc_set.precision, "f32");
+-        strcpy(output_tensor_desc_set.layout, "NCHW");
+-        strcpy(output_tensor_desc_set.precision, "fp32");
++    /* Apply layout and precision from descriptor table.
++     * in_precision == NULL means depth-derived (u8/u16 already set above). */
++    {
++        const ModelDesc *md = &model_table[ivsr_model->model_type];
++        if (md->in_layout)
++            strcpy(input_tensor_desc_set.layout, md->in_layout);
++        if (md->in_precision)
++            strcpy(input_tensor_desc_set.precision, md->in_precision);
++        if (md->out_layout)
++            strcpy(output_tensor_desc_set.layout, md->out_layout);
++        if (md->out_precision)
++            strcpy(output_tensor_desc_set.precision, md->out_precision);
+     }
+     // set scale for non-float type of input
+     if (fabsf(ctx->ivsr_option.normalize_factor - 1) < 1e-6f &&
+@@ -1061,26 +1127,17 @@
+     default:
+         break;
+     }
+-    // set color format of model required
+-    switch (ivsr_model->model_type)
++    /* Set model colour format from descriptor. NULL entries use fallback logic. */
+     {
+-    case BASICVSR:
+-    case EDSR:
+-    case TSENET:
+-    case RIFE:
+-        strcpy(input_tensor_desc_set.model_color_format, "RGB");
+-        break;
+-    case VIDEOPROC:
+-        if (desc->flags & AV_PIX_FMT_FLAG_RGB)
+-            strcpy(input_tensor_desc_set.model_color_format, "RGB");
+-        else
++        const char *mc = model_table[ivsr_model->model_type].model_color;
++        if (mc) {
++            strcpy(input_tensor_desc_set.model_color_format, mc);
++        } else if (ivsr_model->model_type == VIDEOPROC) {
++            strcpy(input_tensor_desc_set.model_color_format,
++                   (desc->flags & AV_PIX_FMT_FLAG_RGB) ? "RGB" : "I420_Three_Planes");
++        } else if (ivsr_model->model_type == CUSTVSR) {
+             strcpy(input_tensor_desc_set.model_color_format, "I420_Three_Planes");
+-        break;
+-    case CUSTVSR:
+-        strcpy(input_tensor_desc_set.model_color_format, "I420_Three_Planes");
+-        break;
+-    default:
+-        break;
++        }
+     }
+     config_input_tensor = create_and_link_config(config_input_res, INPUT_TENSOR_DESC_SETTING, &input_tensor_desc_set, ctx);
+     config_output_tensor = create_and_link_config(config_input_tensor, OUTPUT_TENSOR_DESC_SETTING, &output_tensor_desc_set, ctx);
+@@ -1091,39 +1148,21 @@
+     if (config_nireq == NULL)
+         goto err;
+ 
+-    //TODO: reshape setting follows NHW layout. Hardcode the batch_size as 1.
++    /* Alignment and shape from descriptor table. */
++    {
++        int a = model_table[ivsr_model->model_type].align;
++        if (a > 0) {
++            frame_h = (frame_h + a - 1) / a * a;
++            frame_w = (frame_w + a - 1) / a * a;
++        }
++    }
+     char shape_string[40] = {0};
+-    switch (ivsr_model->model_type) {
+-    case BASICVSR:
+-        //for BasicVSR, the width requires 32-aligned
+-        frame_w = (frame_w + 32 - 1) / 32 * 32;
+-        sprintf(shape_string, "1,%d,%d", frame_h, frame_w);
+-        break;
+-    case VIDEOPROC:
+-        // the input resoultion required 8-aligned
+-        frame_h = (frame_h + ALIGNED_SIZE - 1) / ALIGNED_SIZE * ALIGNED_SIZE;
+-        frame_w = (frame_w + ALIGNED_SIZE - 1) / ALIGNED_SIZE * ALIGNED_SIZE;
+-        sprintf(shape_string, "1,%d,%d", frame_h, frame_w);
+-        break;
+-    case EDSR:
+-        sprintf(shape_string, "1,%d,%d", frame_h, frame_w);
+-        break;
+-    case CUSTVSR:
+-        sprintf(shape_string, "1,%d,%d", frame_h, frame_w);
+-        break;
+-    case TSENET:
+-        sprintf(shape_string, "1,%d,%d", frame_h, frame_w);
+-        break;
+-    case RIFE:
+-        // RIFE model was exported with 128-aligned dimensions; enforce alignment here
+-        frame_h = (frame_h + 128 - 1) / 128 * 128;
+-        frame_w = (frame_w + 128 - 1) / 128 * 128;
+-        sprintf(shape_string, "1,%d,%d", frame_h, frame_w);
+-        break;
+-    default:
++    if (ivsr_model->model_type == UNKNOWN_MODEL ||
++        ivsr_model->model_type >= MODEL_TYPE_NUM) {
+         av_log(ctx, AV_LOG_ERROR, "Not supported model type\n");
+         return DNN_GENERIC_ERROR;
+     }
++    sprintf(shape_string, "1,%d,%d", frame_h, frame_w);
+     config_reshape = create_and_link_config(config_nireq, RESHAPE_SETTINGS, shape_string, ctx);
+     if (config_reshape == NULL)
+         goto err;
+@@ -1161,9 +1200,9 @@
+ 	        goto err;
+ 	    }
+     ivsr_model->nif = nif;
+-    //TODO: hard code nif for TSENET
+-    if(ivsr_model->model_type == TSENET) ivsr_model->nif = 3;
+-    if(ivsr_model->model_type == RIFE)   ivsr_model->nif = 2;
++    /* Override nif from descriptor if set (TSENET=3, RIFE=2, VIDEOSEAL=1). */
++    if (model_table[ivsr_model->model_type].nif_override > 0)
++        ivsr_model->nif = model_table[ivsr_model->model_type].nif_override;
+ 
+     status =
+         ivsr_get_attr(ivsr_model->handle, INPUT_TENSOR_DESC, &input_tensor_desc_get);

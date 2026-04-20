@@ -98,6 +98,7 @@ git apply --ignore-whitespace 0004-*.patch
 git apply --3way --whitespace=fix 0002-*.patch
 git apply --3way --whitespace=fix 0003-*.patch
 git apply --3way --whitespace=fix 0005-*.patch
+git apply --3way --whitespace=fix 0006-*.patch
 ```
 
 All `sed` commands that had previously been used to patch `configure` at build time have been removed — that logic is now fully encoded in patch 0004.
@@ -143,6 +144,73 @@ After a clean build from the updated `build.sh`:
 | `0002` | `git apply --3way` | `dnn_backend_ivsr.c` |
 | `0003` | `git apply --3way` | `dnn_backend_ivsr.c` |
 | `0005` | `git apply --3way` | `dnn_backend_ivsr.c` |
+| `0006` | `git apply --3way` | `dnn_backend_ivsr.c` |
+
+---
+
+## VideoSeal Watermarking + ModelDesc Refactor — Patch 0006
+
+### New file: `patches/0006-Add-VideoSeal-watermarking-model-support.patch`
+
+Adds invisible watermarking support for the VideoSeal model and refactors `dnn_backend_ivsr.c` to use a centralised per-model descriptor table, making future model additions a single-location change.
+
+#### Changes summary
+
+**`ModelType` enum**
+- Adds `VIDEOSEAL` (invisible watermarking, 1-frame 3-channel input, baked payload) before `MODEL_TYPE_NUM`.
+
+**`ModelDesc` descriptor table (new)**
+- Introduces `struct ModelDesc` with fields: `name`, `nif_override`, `channel_divisor`, `align`, `in_layout`, `in_precision`, `out_layout`, `out_precision`, `model_color`, `out_order`, `pack_input` (fn ptr), `unpack_output` (fn ptr).
+- A static `model_table[]` array indexed by `ModelType` holds one row per model — all per-model configuration is in one place.
+- A compile-time `sizeof` assert ensures the table stays in sync with the enum (missing a row is a build error).
+
+**Per-model I/O functions (new)**
+- `pack_input_rife` / `unpack_output_rife` — extracted from the previous inline RIFE code.
+- `pack_input_videoseal` — packs `rgb24` → NCHW float32 **without** `/255` (the model has `/255` baked in via `VideoSealFinalWrapper`).
+- `unpack_output_videoseal` — converts NCHW float32 `[0, 255]` → packed `rgb24` (model already multiplied by 255 internally); clips with `av_clip(r + 0.5f)`.
+
+**`fill_model_input_ivsr()`**
+- Channel divisor now read from `model_table[model_type].channel_divisor` — replaces the TSENET/RIFE if/else chain.
+- Model-specific input packing replaced by a single `model_table[model_type].pack_input(...)` dispatch; BASICVSR and TSENet retain their inline paths (they use `ff_proc_from_frame_to_dnn`).
+
+**`infer_completion_callback()`**
+- `output.order` now read from `model_table[model_type].out_order` — replaces the switch statement.
+- Output unpacking replaced by `model_table[model_type].unpack_output(...)` dispatch; generic `ff_proc` path is the fallback for models with a `NULL` function pointer.
+
+**`get_input_ivsr()`**
+- Channel divisor read from `model_table[model_type].channel_divisor`.
+
+**`ff_dnn_load_model_ivsr()`**
+- Layout/precision, alignment, model colour format, and `nif` override all driven by `model_table` — replaces five separate if/else chains.
+
+#### Adding a new model after this patch
+
+1. Add an enum value to `ModelType`.
+2. Add one row to `model_table[]`.
+3. Optionally write `pack_input_<name>` / `unpack_output_<name>` if the generic `ff_proc` path is insufficient; otherwise set the pointers to `NULL`.
+
+No other changes are needed anywhere in the file.
+
+#### Usage
+
+Export the model (bakes payload + normalisation):
+```bash
+cd sandesh/iVSR
+python3 videoseal/export_videoseal_openvino.py --text "YOUR_WATERMARK" --height 720 --width 1280
+```
+
+Run watermarking (input must be 1280×720; scale beforehand if needed):
+```bash
+LD_LIBRARY_PATH=<build_dir>/libavfilter \
+<build_dir>/ffmpeg \
+  -i input.mp4 \
+  -vf "scale=1280:720,format=rgb24,dnn_processing=dnn_backend=ivsr:model=/path/to/videoseal_baked_720p.xml:model_type=6:nif=1:device=CPU:normalize_factor=1.0" \
+  -c:v libx264 -crf 18 -pix_fmt yuv420p output_watermarked.mp4
+```
+
+`model_type=6` corresponds to the `VIDEOSEAL` enum value.
+
+> **Note:** `LD_LIBRARY_PATH` is required when the system `/usr/local/lib/libavfilter.so.11` is an older build. Run `sudo make install && sudo ldconfig` from the FFmpeg build directory to install the updated library system-wide and avoid it.
 
 ---
 

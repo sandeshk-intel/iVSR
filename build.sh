@@ -159,6 +159,7 @@ build_ffmpeg() {
   git apply --3way --whitespace=fix 0002-*.patch
   git apply --3way --whitespace=fix 0003-*.patch
   git apply --3way --whitespace=fix 0005-*.patch
+  git apply --3way --whitespace=fix 0006-*.patch
 
   ./configure \
       --enable-gpl \
@@ -220,13 +221,13 @@ main() {
     shift
   done
 
-  prepare_dependencies
-  config_git_users
-  if [ "$ov_version" = "2022.3" ]; then
-    install_openvino_from_source
-  else
-    install_openvino_from_apt "$ov_version" 
-  fi
+  # prepare_dependencies
+  # config_git_users
+  # if [ "$ov_version" = "2022.3" ]; then
+  #   install_openvino_from_source
+  # else
+  #   install_openvino_from_apt "$ov_version" 
+  # fi
   build_install_ivsr_sdk
   build_ffmpeg
 }

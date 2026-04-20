@@ -29,6 +29,14 @@ DEFAULT_OP_XML = str(
 # Default RIFE model path (sibling rife_ov directory)
 DEFAULT_RIFE_MODEL = str(_REPO_ROOT.parent / "rife_ov" / "rife.xml")
 
+# Local patched FFmpeg build (has model_type=6 / VideoSeal compiled in)
+DEFAULT_LOCAL_FFMPEG = str(
+    _REPO_ROOT / "ivsr_ffmpeg_plugin" / "ffmpeg" / "ffmpeg"
+)
+DEFAULT_LOCAL_LIBAVFILTER = str(
+    _REPO_ROOT / "ivsr_ffmpeg_plugin" / "ffmpeg" / "libavfilter"
+)
+
 # Mapping: display name → (model_type int, nif default, normalize_factor default,
 #          needs_extension, pixel_format, description)
 VSR_MODELS = {
@@ -361,16 +369,31 @@ def _parse_ffmpeg_progress(line: str) -> tuple[int, float]:
     return frame, fps
 
 
-def run_ffmpeg(cmd: list[str], status_text, total_frames: int = 0) -> tuple[int, str, float]:
-    """Run FFmpeg, show progress, return (returncode, stderr, elapsed)."""
+def run_ffmpeg(cmd: list[str], status_text, total_frames: int = 0,
+               extra_env: dict | None = None) -> tuple[int, str, float]:
+    """Run FFmpeg, show progress, return (returncode, stderr, elapsed).
+
+    extra_env: optional dict of additional environment variables (e.g.
+               {"LD_LIBRARY_PATH": "/path/to/libavfilter"}).  Values are
+               merged on top of the current process environment so all
+               standard paths remain intact.
+    """
+    import os as _os
     start = time.time()
     stderr_lines: list[str] = []
+
+    run_env = None
+    if extra_env:
+        run_env = _os.environ.copy()
+        run_env.update(extra_env)
+
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         text=True,
         bufsize=1,
+        env=run_env,
     )
     for line in proc.stderr:  # type: ignore[union-attr]
         line = line.rstrip()
@@ -541,6 +564,214 @@ def save_model_uploads(xml_file, bin_file, key: str) -> str | None:
     return xml_path
 
 
+def build_videoseal_ffmpeg_cmd(
+    ffmpeg_bin: str,
+    input_video: str,
+    output_video: str,
+    model_path: str,
+    target_w: int,
+    target_h: int,
+    device: str,
+    nireq: int,
+    num_streams: int,
+    crf: int = 18,
+    codec: str = "libx264",
+    lossless: bool = False,
+) -> list[str]:
+    """Build the FFmpeg command for VideoSeal invisible watermark embedding.
+
+    model_type=6  — VIDEOSEAL enum value in dnn_backend_ivsr.c
+    normalize_factor=1.0 — the model has /255 and *255 baked in
+    Input must be rgb24 at exactly the resolution the model was exported for.
+
+    lossless=True  → FFV1 level 3, pix_fmt rgb24 (bit-exact; no chroma subsampling)
+    lossless=False → lossy codec with CRF and pix_fmt yuv420p
+    """
+    dnn_filter = (
+        f"dnn_processing=dnn_backend=ivsr"
+        f":model={model_path}"
+        f":input=input"
+        f":output=output"
+        f":model_type=6"
+        f":nif=1"
+        f":nireq={nireq}"
+        f":num_streams={num_streams}"
+        f":device={device}"
+        f":normalize_factor=1.0"
+    )
+    vf = f"scale={target_w}:{target_h},format=rgb24,{dnn_filter}"
+    if lossless:
+        # FFV1 with rgb24 preserves every watermarked pixel exactly.
+        # yuv420p would destroy chroma precision even with a lossless codec.
+        encode_args = ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "rgb24"]
+    else:
+        encode_args = ["-c:v", codec, "-crf", str(crf), "-pix_fmt", "yuv420p"]
+    cmd = [
+        ffmpeg_bin, "-y", "-i", input_video,
+        "-vf", vf,
+        *encode_args,
+        "-c:a", "copy",
+        output_video,
+    ]
+    return cmd
+
+
+def extract_videoseal_watermark(video_path: str) -> tuple[str, float]:
+    """Extract the invisible watermark from a VideoSeal-watermarked video.
+
+    Uses the official VideoSeal ``detect()`` API (same approach as
+    videoseal/extract_videoseal.py) which bypasses training-time augmentation.
+
+    Returns:
+        (extracted_text, confidence_pct)  where confidence_pct is in [0, 100].
+        confidence_pct is 0.0 for older models that don't output a presence bit.
+    """
+    import cv2
+    import torch
+    import videoseal as _vs
+
+    model = _vs.load("videoseal")
+    model.eval()
+
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total == 0:
+        cap.release()
+        raise RuntimeError(f"Could not read any frame from: {video_path}")
+
+    # Sample up to 20 frames evenly and average raw logit scores.
+    # Single-frame extraction is fragile: H.264/H.265 compression artifacts in
+    # high-motion content (e.g. cricket) can flip individual payload bits.
+    # Averaging logits across many frames lets the watermark signal dominate.
+    max_frames = 20
+    step = max(1, total // max_frames)
+    scores = None
+    confidence_sum = 0.0
+    sampled = 0
+    for i in range(0, total, step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame_bgr = cap.read()
+        if not ret:
+            continue
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        tensor = (
+            torch.from_numpy(frame_rgb)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .float()
+            / 255.0
+        )
+        with torch.no_grad():
+            detected = model.detect(tensor)
+        preds = detected["preds"]
+        if preds.shape[-1] > 256:
+            confidence_sum += float(torch.sigmoid(preds[0, 0]).item())
+            payload_logits = preds[0, 1:]
+        else:
+            payload_logits = preds[0]
+        scores = payload_logits if scores is None else scores + payload_logits
+        sampled += 1
+    cap.release()
+
+    if scores is None:
+        raise RuntimeError(f"No frames could be decoded from: {video_path}")
+
+    confidence = (confidence_sum / sampled * 100.0) if sampled > 0 else 0.0
+    payload = scores
+
+    bits = (payload > 0).int().flatten().tolist()[:256]
+    chars: list[str] = []
+    for i in range(0, len(bits) - 7, 8):
+        byte = bits[i : i + 8]
+        code = int("".join(map(str, byte)), 2)
+        if code == 0:
+            break
+        chars.append(chr(code))
+
+    return "".join(chars), confidence
+
+
+def extract_videoseal_watermark_ov(video_path: str, detector_xml: str) -> tuple[str, float]:
+    """Extract the invisible watermark using an OpenVINO IR detector model.
+
+    The detector IR is produced by
+    ``videoseal/export_videoseal_detector_openvino.py``.
+
+    Input to the model: ``[1, 3, 256, 256]`` NCHW float32 in ``[0, 1]``.
+    Output: ``[1, 257]`` raw logits — index 0 = presence bit, 1–256 = payload.
+
+    Frames are sampled evenly (up to 20) and raw logits are averaged before
+    thresholding, making extraction robust to H.264/H.265 compression noise.
+
+    Returns:
+        (extracted_text, confidence_pct)  where confidence_pct is in [0, 100].
+    """
+    import cv2
+    import numpy as np
+    import openvino as ov
+
+    core = ov.Core()
+    compiled = core.compile_model(detector_xml, "CPU")
+    infer_req = compiled.create_infer_request()
+
+    cap = cv2.VideoCapture(video_path)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total == 0:
+        cap.release()
+        raise RuntimeError(f"Could not read any frame from: {video_path}")
+
+    max_frames = 20
+    step = max(1, total // max_frames)
+    scores: "np.ndarray | None" = None
+    confidence_sum = 0.0
+    sampled = 0
+
+    for i in range(0, total, step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame_bgr = cap.read()
+        if not ret:
+            continue
+
+        # BGR → RGB, resize to 256×256 (matches model.detect() internals), NCHW [0,1]
+        # Use INTER_AREA for downscaling: it correctly averages source pixels into
+        # the smaller destination, closely matching PyTorch's antialias=True bilinear.
+        # INTER_LINEAR without antialias causes ~16 bit-sign mismatches per frame at HD.
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        frame_256 = cv2.resize(frame_rgb, (256, 256), interpolation=cv2.INTER_AREA)
+        inp = frame_256.astype(np.float32).transpose(2, 0, 1)[np.newaxis] / 255.0
+
+        result = infer_req.infer({0: inp})
+        preds = list(result.values())[0]  # [1, 257]
+
+        if preds.shape[-1] > 256:
+            # sigmoid of index 0 = presence confidence
+            confidence_sum += float(1.0 / (1.0 + np.exp(-float(preds[0, 0]))))
+            payload_logits = preds[0, 1:]
+        else:
+            payload_logits = preds[0]
+
+        scores = payload_logits if scores is None else scores + payload_logits
+        sampled += 1
+
+    cap.release()
+
+    if scores is None:
+        raise RuntimeError(f"No frames could be decoded from: {video_path}")
+
+    confidence = (confidence_sum / sampled * 100.0) if sampled > 0 else 0.0
+
+    bits = (scores > 0).astype(int).flatten().tolist()[:256]
+    chars: list[str] = []
+    for i in range(0, len(bits) - 7, 8):
+        byte = bits[i : i + 8]
+        code = int("".join(map(str, byte)), 2)
+        if code == 0:
+            break
+        chars.append(chr(code))
+
+    return "".join(chars), confidence
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Parameter UI builders (shared between tabs)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -685,7 +916,7 @@ st.markdown(
 
 # ── Sidebar: global settings ──────────────────────────────────────────────────
 with st.sidebar:
-    st.header("⚙️ Global Settings")
+    st.header("Global Settings")
 
     ffmpeg_bin = st.text_input(
         "FFmpeg binary path",
@@ -701,7 +932,12 @@ with st.sidebar:
     st.caption("Source: [github.com/OpenVisualCloud/iVSR](https://github.com/OpenVisualCloud/iVSR)")
 
 # ── Main tabs ─────────────────────────────────────────────────────────────────
-tab_vsr, tab_svp, tab_rife = st.tabs(["📺 Video Super Resolution (VSR)", "🗜️ Smart Video Processing (SVP)", "🎞️ Frame Interpolation (RIFE)"])
+tab_vsr, tab_svp, tab_rife, tab_vs = st.tabs([
+    "Video Super Resolution (VSR)",
+    "Smart Video Processing (SVP)",
+    "Frame Interpolation (RIFE)",
+    "Invisible Watermarking (VideoSeal)",
+])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -792,7 +1028,7 @@ with tab_vsr:
             op_xml=vsr_ext_params.get("op_xml", ""),
             batch_size=int(vsr_params["batch_size"]),
         )
-        with st.expander("📋 Generated FFmpeg Command", expanded=False):
+        with st.expander("Generated FFmpeg Command", expanded=False):
             st.code(cmd_to_display_string(_preview_cmd), language="bash")
 
     # ── Run button ────────────────────────────────────────────────────────────
@@ -861,7 +1097,7 @@ with tab_vsr:
                 }
             else:
                 st.session_state.pop("vsr_result", None)
-                st.error(f"❌ FFmpeg failed (exit code {rc})")
+                st.error(f"FFmpeg failed (exit code {rc})")
                 with st.expander("FFmpeg stderr"):
                     st.code(stderr, language="text")
 
@@ -870,7 +1106,7 @@ with tab_vsr:
         res = st.session_state["vsr_result"]
         ii = res.get("in_info", {})
         oi = res.get("out_info", {})
-        st.success(f"✅ Done in **{res['elapsed']:.1f}s** | Throughput: {res['throughput']} fps" if res.get('throughput') else f"✅ Done in **{res['elapsed']:.1f}s**")
+        st.success(f"Done in **{res['elapsed']:.1f}s** | Throughput: {res['throughput']} fps" if res.get('throughput') else f"Done in **{res['elapsed']:.1f}s**")
 
         # ── Before / After comparison ─────────────────────────────────────────
         res_str = lambda w, h: f"{w}×{h}" if w else "N/A"
@@ -978,7 +1214,7 @@ with tab_svp:
     svp_output_video = os.path.join(tempfile.gettempdir(), "ivsr_svp_output.mp4")
 
     # ── Encoding options ──────────────────────────────────────────────────────
-    with st.expander("🎛️ Encoding Options"):
+    with st.expander("Encoding Options"):
         col_enc1, col_enc2 = st.columns(2)
         with col_enc1:
             svp_codec = st.selectbox(
@@ -1021,7 +1257,7 @@ with tab_svp:
             batch_size=int(svp_params["batch_size"]),
             extra_encode_flags=svp_extra_flags,
         )
-        with st.expander("📋 Generated FFmpeg Command", expanded=True):
+        with st.expander("Generated FFmpeg Command", expanded=False):
             st.code(cmd_to_display_string(cmd), language="bash")
 
     # ── Run button ────────────────────────────────────────────────────────────
@@ -1081,7 +1317,7 @@ with tab_svp:
                 }
             else:
                 st.session_state.pop("svp_result", None)
-                st.error(f"❌ FFmpeg failed (exit code {rc})")
+                st.error(f"FFmpeg failed (exit code {rc})")
                 with st.expander("FFmpeg stderr"):
                     st.code(stderr, language="text")
 
@@ -1090,7 +1326,7 @@ with tab_svp:
         res = st.session_state["svp_result"]
         ii = res.get("in_info", {})
         oi = res.get("out_info", {})
-        st.success(f"✅ Done in **{res['elapsed']:.1f}s** | Throughput: {res['throughput']} fps" if res.get('throughput') else f"✅ Done in **{res['elapsed']:.1f}s**")
+        st.success(f"Done in **{res['elapsed']:.1f}s** | Throughput: {res['throughput']} fps" if res.get('throughput') else f"Done in **{res['elapsed']:.1f}s**")
 
         # ── Before / After comparison ─────────────────────────────────────────
         size_str = lambda s: f"{s / 1024 / 1024:.1f} MB" if s else "N/A"
@@ -1125,7 +1361,7 @@ with tab_svp:
                     stat("Resolution", f"{oi.get('width','?')}×{oi.get('height','?')}" if oi.get('width') else "N/A"),
                 )
                 st.download_button(
-                    "⬇️ Download Output",
+                    "Download Output",
                     data=open(res["output"], "rb").read(),
                     file_name="svp_output.mp4",
                     mime="video/mp4",
@@ -1260,34 +1496,35 @@ with tab_rife:
     st.markdown("#### Output Mode")
     rife_mode_label = st.radio(
         "Mode",
-        ["2x FPS - originals + interpolated (recommended)", "Midpoints only"],
+        ["2x FPS - originals + interpolated (recommended)"],
+        # ["2x FPS - originals + interpolated (recommended)", "Midpoints only"],
         index=0,
         key="rife_mode",
         help=(
             "2x FPS: keeps all original frames and inserts one interpolated frame "
             "between each pair, resulting in 2x frame count with full sharpness on originals.  "
-            "Midpoints only: emits only the RIFE-generated frames. Used for "
-            "debugging or special effects."
+            # "Midpoints only: emits only the RIFE-generated frames. Used for "
+            # "debugging or special effects."
         ),
     )
     rife_mode = "2xfps" if rife_mode_label.startswith("2x FPS") else "midpoints"
 
     rife_smooth_filter = "none"
-    if rife_mode == "midpoints":
-        rife_smooth_filter = st.selectbox(
-            "Post-processing smooth filter",
-            ["none", "hqdn3d (temporal denoise — fixes spatial wave/ripple)", "deflicker (fixes luminance flicker)"],
-            index=1,
-            key="rife_smooth_filter",
-            help=(
-                "**hqdn3d**: averages each pixel across neighbouring frames in time — "
-                "best for the spatial wobble/wave caused by independent RIFE optical-flow errors.  \n"
-                "**deflicker**: normalises per-frame brightness — only helps with luminance flicker.  \n"
-                "**none**: no post-processing."
-            ),
-        )
-        # Extract the key before the first space/parenthesis
-        rife_smooth_filter = rife_smooth_filter.split()[0]
+    # if rife_mode == "midpoints":
+    #     rife_smooth_filter = st.selectbox(
+    #         "Post-processing smooth filter",
+    #         ["none", "hqdn3d (temporal denoise — fixes spatial wave/ripple)", "deflicker (fixes luminance flicker)"],
+    #         index=1,
+    #         key="rife_smooth_filter",
+    #         help=(
+    #             "**hqdn3d**: averages each pixel across neighbouring frames in time — "
+    #             "best for the spatial wobble/wave caused by independent RIFE optical-flow errors.  \n"
+    #             "**deflicker**: normalises per-frame brightness — only helps with luminance flicker.  \n"
+    #             "**none**: no post-processing."
+    #         ),
+    #     )
+    #     # Extract the key before the first space/parenthesis
+    #     rife_smooth_filter = rife_smooth_filter.split()[0]
 
     st.markdown("---")
 
@@ -1332,7 +1569,7 @@ with tab_rife:
     )
 
     # ── Encoding options ──────────────────────────────────────────────────────
-    with st.expander("Encoding Options"):
+    with st.expander("RIFE Encoding Options"):
         col_enc1, col_enc2 = st.columns(2)
         with col_enc1:
             rife_codec = st.selectbox(
@@ -1373,7 +1610,7 @@ with tab_rife:
             extra_encode_flags=rife_encode_flags,
             smooth_filter=rife_smooth_filter,
         )
-        with st.expander("Generated FFmpeg Command", expanded=True):
+        with st.expander("RIFE Generated FFmpeg Command", expanded=False):
             st.code(cmd_to_display_string(_rife_preview_cmd), language="bash")
 
     # ── Run button ────────────────────────────────────────────────────────────
@@ -1437,7 +1674,7 @@ with tab_rife:
                 }
             else:
                 st.session_state.pop("rife_result", None)
-                st.error(f"FFmpeg failed (exit code {rife_rc})")
+                st.error(f"RIFE FFmpeg failed (exit code {rife_rc})")
                 with st.expander("FFmpeg stderr"):
                     st.code(rife_stderr, language="text")
 
@@ -1451,7 +1688,7 @@ with tab_rife:
             if res.get("mode") == "2xfps" else "midpoints only"
         )
         tp_str = f" | Throughput: {res['throughput']} fps" if res.get("throughput") else ""
-        st.success(f"Done in **{res['elapsed']:.1f}s**{tp_str}")
+        st.success(f"RIFE done in **{res['elapsed']:.1f}s**{tp_str}")
 
         res_str  = lambda w, h: f"{w}x{h}" if w else "N/A"
         size_str = lambda s: f"{s / 1024 / 1024:.1f} MB" if s else "N/A"
@@ -1500,3 +1737,450 @@ with tab_rife:
                 )
             else:
                 st.warning("Output file not found.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 4 — VideoSeal Invisible Watermarking
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_vs:
+    st.subheader("Invisible Watermarking — VideoSeal (model_type=6)")
+    st.markdown(
+        "Embed an imperceptible per-frame watermark into a video using the "
+        "[Meta VideoSeal](https://ai.meta.com/research/publications/videoseal/) model "
+        "running through the iVSR FFmpeg plugin, then extract and verify it."
+    )
+    st.info(
+        "**How it works**  \n"
+        "- The watermark bit-string is baked into the model at export time "
+        "(`videoseal/export_videoseal_openvino.py`).  \n"
+        "- The FFmpeg filter applies the model frame-by-frame: `model_type=6`, "
+        "`nif=1`, `normalize_factor=1.0` (normalisation is inside the model).  \n"
+        "- Extraction uses Meta's `model.detect()` API on the first frame to "
+        "recover the payload and a watermark-presence confidence score."
+    )
+
+    st.markdown("---")
+
+    # ── Two sub-sections: Embed and Extract ────────────────────────────────
+    vs_embed_tab, vs_extract_tab = st.tabs(["Embed Watermark", "Extract Watermark"])
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SUB-TAB A — Embed
+    # ─────────────────────────────────────────────────────────────────────────
+    with vs_embed_tab:
+        st.markdown("#### Model")
+        st.caption(
+            "The VideoSeal OpenVINO IR model must be exported **with the watermark "
+            "payload baked in** using `videoseal/export_videoseal_openvino.py`. "
+            "The model is **resolution-specific** — set the target size to match "
+            "the resolution used during export (default: 1280×720)."
+        )
+
+        col_vx, col_vb = st.columns(2)
+        with col_vx:
+            vs_xml_file = st.file_uploader(
+                "Upload VideoSeal Model (.xml)",
+                type=["xml"],
+                key="vs_xml_upload",
+                help="OpenVINO IR XML produced by export_videoseal_openvino.py.",
+            )
+        with col_vb:
+            vs_bin_file = st.file_uploader(
+                "Upload VideoSeal Weights (.bin)",
+                type=["bin"],
+                key="vs_bin_upload",
+                help="OpenVINO IR binary weights matching the .xml.",
+            )
+        vs_model_path = save_model_uploads(vs_xml_file, vs_bin_file, "vs")
+
+        st.markdown("---")
+        st.markdown("#### Input Video")
+        vs_video_file = st.file_uploader(
+            "Upload Input Video",
+            type=["mp4", "mkv", "avi", "mov", "webm", "ts"],
+            key="vs_video_upload",
+        )
+        vs_input_video = save_upload(vs_video_file, ".mp4", "vs_video")
+        vs_output_video = os.path.join(tempfile.gettempdir(), "ivsr_vs_output.mp4")
+
+        _vs_src_info: dict = {}
+        if vs_input_video:
+            _vs_src_info = probe_video(vs_input_video, ffmpeg_bin)
+            st.caption(
+                f"Source: **{_vs_src_info['width']}×{_vs_src_info['height']}** · "
+                f"**{_vs_src_info['fps']} fps** · "
+                f"**{_vs_src_info['nb_frames']} frames** · "
+                f"{int(_vs_src_info['duration'] // 60)}m "
+                f"{_vs_src_info['duration'] % 60:.1f}s"
+            )
+
+        st.markdown("---")
+        st.markdown("#### Target Resolution")
+        st.caption(
+            "Must match the resolution the model was exported for. "
+            "Input frames are scaled to this size before watermarking."
+        )
+        col_vw, col_vh = st.columns(2)
+        with col_vw:
+            vs_w = st.number_input(
+                "Target Width",
+                min_value=2, max_value=7680,
+                value=_vs_src_info.get("width") or 1280,
+                step=2,
+                key="vs_width",
+            )
+        with col_vh:
+            vs_h = st.number_input(
+                "Target Height",
+                min_value=2, max_value=4320,
+                value=_vs_src_info.get("height") or 720,
+                step=2,
+                key="vs_height",
+            )
+
+        st.markdown("---")
+        st.markdown("#### Inference Parameters")
+        col_vd, col_vnr, col_vns = st.columns(3)
+        with col_vd:
+            vs_device = st.selectbox(
+                "Target Device", DEVICE_OPTIONS, index=0, key="vs_device",
+            )
+        with col_vnr:
+            vs_nireq = st.number_input(
+                "Inference Requests (nireq)",
+                min_value=1, max_value=32, value=4, step=1,
+                key="vs_nireq",
+                help="Parallel OpenVINO inference requests.",
+            )
+        with col_vns:
+            _vs_gpu = vs_device.startswith("GPU") or vs_device in ("MULTI:GPU.0,GPU.1", "AUTO")
+            vs_num_streams = st.number_input(
+                "GPU Streams (num_streams)",
+                min_value=1, max_value=16, value=1, step=1,
+                disabled=not _vs_gpu,
+                key="vs_num_streams",
+            )
+        st.caption("**model_type:** 6 · **nif:** 1 · **normalize_factor:** 1.0 *(all fixed)*")
+
+        with st.expander("Encoding Options"):
+            col_ec1, col_ec2 = st.columns(2)
+            with col_ec1:
+                vs_codec_choice = st.selectbox(
+                    "Output Codec",
+                    ["libx264", "libx265", "FFV1 (lossless, rgb24)"],
+                    index=0,
+                    key="vs_codec",
+                    help=(
+                        "**FFV1 (lossless, rgb24)**: bit-exact output — preserves every "
+                        "watermarked pixel. Recommended for reliable single-frame extraction.  \n"
+                        "**libx264/libx265**: lossy — multi-frame averaging compensates."
+                    ),
+                )
+            vs_lossless = vs_codec_choice == "FFV1 (lossless, rgb24)"
+            vs_codec = vs_codec_choice if not vs_lossless else "libx264"
+            with col_ec2:
+                vs_crf = st.slider(
+                    "CRF (quality, lower=better)",
+                    min_value=0, max_value=51, value=18,
+                    key="vs_crf",
+                    disabled=vs_lossless,
+                    help="Ignored when FFV1 lossless is selected.",
+                )
+
+        st.markdown("---")
+        st.markdown("#### FFmpeg Binary & Library Path")
+        st.caption(
+            "VideoSeal requires the **locally built** iVSR-patched FFmpeg "
+            "(`model_type=6` is not in the system build). The `LD_LIBRARY_PATH` "
+            "must point to the freshly built `libavfilter` so the patched "
+            "`.so` is loaded instead of the system one."
+        )
+        col_fb, col_lp = st.columns(2)
+        with col_fb:
+            _local_ffmpeg_exists = os.path.isfile(DEFAULT_LOCAL_FFMPEG)
+            vs_ffmpeg_bin = st.text_input(
+                "FFmpeg binary (VideoSeal)",
+                value=DEFAULT_LOCAL_FFMPEG if _local_ffmpeg_exists else ffmpeg_bin,
+                key="vs_ffmpeg_bin",
+                help="Path to the locally built FFmpeg binary that has model_type=6 compiled in.",
+            )
+        with col_lp:
+            vs_lib_path = st.text_input(
+                "LD_LIBRARY_PATH (libavfilter dir)",
+                value=DEFAULT_LOCAL_LIBAVFILTER,
+                key="vs_lib_path",
+                help=(
+                    "Directory containing the patched libavfilter.so.11. "
+                    "Leave blank if the system library is already up to date."
+                ),
+            )
+
+        # ── Command preview ───────────────────────────────────────────────────
+        if vs_model_path and vs_input_video:
+            _vs_preview_cmd = build_videoseal_ffmpeg_cmd(
+                ffmpeg_bin=vs_ffmpeg_bin,
+                input_video=vs_input_video,
+                output_video=vs_output_video,
+                model_path=vs_model_path,
+                target_w=int(vs_w),
+                target_h=int(vs_h),
+                device=vs_device,
+                nireq=int(vs_nireq),
+                num_streams=int(vs_num_streams),
+                crf=int(vs_crf),
+                codec=vs_codec,
+                lossless=vs_lossless,
+            )
+            _vs_env_prefix = (
+                f"LD_LIBRARY_PATH={vs_lib_path} \\\n" if vs_lib_path.strip() else ""
+            )
+            with st.expander("Generated FFmpeg Command", expanded=False):
+                st.code(
+                    _vs_env_prefix + cmd_to_display_string(_vs_preview_cmd),
+                    language="bash",
+                )
+
+        # ── Run button ────────────────────────────────────────────────────────
+        st.markdown("---")
+        vs_run = st.button("Embed Watermark", key="vs_run")
+        if vs_run:
+            errors = []
+            if not vs_model_path:
+                errors.append("Provide a VideoSeal model (.xml + .bin) or enable the default model above.")
+            if not vs_input_video:
+                errors.append("Upload an input video file.")
+            if not os.path.isfile(vs_ffmpeg_bin):
+                errors.append(
+                    f"FFmpeg binary not found: `{vs_ffmpeg_bin}`.  \n"
+                    "Build the iVSR-patched FFmpeg first: `cd sandesh/iVSR && bash build.sh`"
+                )
+            for e in errors:
+                st.error(e)
+
+            if not errors:
+                _vs_cmd = build_videoseal_ffmpeg_cmd(
+                    ffmpeg_bin=vs_ffmpeg_bin,
+                    input_video=vs_input_video,
+                    output_video=vs_output_video,
+                    model_path=vs_model_path,
+                    target_w=int(vs_w),
+                    target_h=int(vs_h),
+                    device=vs_device,
+                    nireq=int(vs_nireq),
+                    num_streams=int(vs_num_streams),
+                    crf=int(vs_crf),
+                    codec=vs_codec,
+                    lossless=vs_lossless,
+                )
+                _vs_extra_env = (
+                    {"LD_LIBRARY_PATH": vs_lib_path.strip()}
+                    if vs_lib_path.strip() else None
+                )
+                _vs_probe = probe_video(vs_input_video, ffmpeg_bin)
+                _vs_total = (
+                    int(_vs_probe["nb_frames"])
+                    if str(_vs_probe["nb_frames"]).isdigit() else 0
+                )
+                vs_status = st.empty()
+                with st.spinner("Embedding watermark via VideoSeal..."):
+                    vs_rc, vs_stderr, vs_elapsed = run_ffmpeg(
+                        _vs_cmd, vs_status,
+                        total_frames=_vs_total,
+                        extra_env=_vs_extra_env,
+                    )
+                vs_status.empty()
+
+                if vs_rc == 0:
+                    with st.spinner("Optimising output for playback..."):
+                        apply_faststart(vs_output_video, vs_ffmpeg_bin)
+                    in_info = probe_video(vs_input_video, ffmpeg_bin)
+                    out_info = probe_video(vs_output_video, ffmpeg_bin)
+                    throughput = (
+                        round(int(out_info["nb_frames"]) / vs_elapsed, 1)
+                        if str(out_info.get("nb_frames", "N/A")).isdigit() else None
+                    )
+                    st.session_state["vs_result"] = {
+                        "output": vs_output_video,
+                        "input": vs_input_video,
+                        "elapsed": vs_elapsed,
+                        "in_info": in_info,
+                        "out_info": out_info,
+                        "throughput": throughput,
+                    }
+                else:
+                    st.session_state.pop("vs_result", None)
+                    st.error(f"FFmpeg failed (exit code {vs_rc})")
+                    with st.expander("FFmpeg stderr"):
+                        st.code(vs_stderr, language="text")
+
+        # ── Results ───────────────────────────────────────────────────────────
+        if "vs_result" in st.session_state:
+            res = st.session_state["vs_result"]
+            ii = res.get("in_info", {})
+            oi = res.get("out_info", {})
+            tp_str = f" | Throughput: {res['throughput']} fps" if res.get("throughput") else ""
+            st.success(f"Done in **{res['elapsed']:.1f}s**{tp_str}")
+
+            size_str  = lambda s: f"{s / 1024 / 1024:.1f} MB" if s else "N/A"
+            br_str    = lambda k: f"{k:,} kbps" if k else "N/A"
+            dur_str   = lambda d: f"{int(d // 60)}m {d % 60:.1f}s" if d else "N/A"
+            res_str   = lambda w, h: f"{w}×{h}" if w else "N/A"
+
+            col_vi, col_vo = st.columns(2)
+            with col_vi:
+                st.markdown("**Input Video (original)**")
+                st.video(make_preview(res["input"], ffmpeg_bin))
+                stats_block(
+                    stat("Resolution", res_str(ii.get("width"), ii.get("height"))),
+                    stat("Bitrate",    br_str(ii.get("bitrate_kbps", 0))),
+                    stat("File Size",  size_str(ii.get("size", 0))),
+                    stat("Duration",   dur_str(ii.get("duration", 0))),
+                )
+            with col_vo:
+                st.markdown("**Output Video (watermarked — visually identical)**")
+                if os.path.isfile(res["output"]):
+                    st.video(res["output"])
+                    stats_block(
+                        stat("Resolution", res_str(oi.get("width"), oi.get("height"))),
+                        stat("Bitrate",    br_str(oi.get("bitrate_kbps", 0))),
+                        stat("File Size",  size_str(oi.get("size", 0))),
+                        stat("Duration",   dur_str(oi.get("duration", 0))),
+                    )
+                    st.download_button(
+                        "Download Watermarked Video",
+                        data=open(res["output"], "rb").read(),
+                        file_name="videoseal_watermarked.mp4",
+                        mime="video/mp4",
+                        key="vs_download",
+                    )
+                else:
+                    st.warning("Output file not found.")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SUB-TAB B — Extract
+    # ─────────────────────────────────────────────────────────────────────────
+    with vs_extract_tab:
+        st.markdown("#### Extract Watermark from Video")
+        st.markdown(
+            "Recover the embedded payload from a VideoSeal-watermarked video. "
+            "Up to 20 frames are sampled evenly and logit scores are averaged "
+            "before thresholding — this makes extraction robust to H.264/H.265 "
+            "compression artifacts in high-motion content."
+        )
+
+        st.markdown("---")
+
+        # ── Detector Model (OpenVINO IR) ──────────────────────────────────────
+        st.markdown("#### Detector Model (OpenVINO IR)")
+        st.caption(
+            "Export once with: "
+            "`python3 videoseal/export_videoseal_detector_openvino.py`  \n"
+            "Produces `videoseal_detector.xml` + `videoseal_detector.bin`"
+        )
+        col_dxml, col_dbin = st.columns(2)
+        with col_dxml:
+            vs_det_xml = st.file_uploader(
+                "Detector Model (.xml)",
+                type=["xml"],
+                key="vs_det_xml_upload",
+                help="OpenVINO IR XML for the VideoSeal detector.",
+            )
+        with col_dbin:
+            vs_det_bin = st.file_uploader(
+                "Detector Weights (.bin)",
+                type=["bin"],
+                key="vs_det_bin_upload",
+                help="OpenVINO IR binary weights. Must match the .xml.",
+            )
+        vs_detector_path = save_model_uploads(vs_det_xml, vs_det_bin, "vs_detector")
+
+        st.markdown("---")
+
+        # ── Video source ──────────────────────────────────────────────────────
+        st.markdown("#### Video Source")
+        _vs_embed_result = st.session_state.get("vs_result")
+        if _vs_embed_result and os.path.isfile(_vs_embed_result.get("output", "")):
+            use_embed_output = st.checkbox(
+                "Use watermarked video produced by the Embed tab",
+                value=True,
+                key="vs_extract_use_embed",
+            )
+            if use_embed_output:
+                vs_extract_src = _vs_embed_result["output"]
+                st.caption(f"Using: `{vs_extract_src}`")
+            else:
+                vs_extract_src = None
+        else:
+            use_embed_output = False
+            vs_extract_src = None
+
+        if not use_embed_output:
+            vs_ext_video_file = st.file_uploader(
+                "Upload Watermarked Video",
+                type=["mp4", "mkv", "avi", "mov", "webm", "ts"],
+                key="vs_extract_upload",
+                help="Any video watermarked with VideoSeal.",
+            )
+            vs_extract_src = save_upload(vs_ext_video_file, ".mp4", "vs_extract_video")
+
+        st.markdown("---")
+
+        # ── Run button ────────────────────────────────────────────────────────
+        vs_extract_run = st.button("Extract Watermark", key="vs_extract_run")
+        if vs_extract_run:
+            errors = []
+            if not vs_extract_src:
+                errors.append("Provide a watermarked video to extract from.")
+            if not vs_detector_path:
+                errors.append("Upload both the detector .xml and .bin files.")
+            if errors:
+                for e in errors:
+                    st.error(e)
+            else:
+                with st.spinner("Loading OpenVINO detector and extracting payload..."):
+                    try:
+                        extracted_text, confidence_pct = extract_videoseal_watermark_ov(
+                            vs_extract_src, vs_detector_path
+                        )
+                        st.session_state["vs_extract_result"] = {
+                            "text": extracted_text,
+                            "confidence": confidence_pct,
+                            "src": vs_extract_src,
+                        }
+                    except Exception as ex:
+                        st.session_state.pop("vs_extract_result", None)
+                        st.error(f"Extraction failed: {ex}")
+
+        # ── Results ───────────────────────────────────────────────────────────
+        if "vs_extract_result" in st.session_state:
+            er = st.session_state["vs_extract_result"]
+            st.success("Watermark extracted")
+
+            if os.path.isfile(er["src"]):
+                st.markdown("**Analysed Video**")
+                st.video(make_preview(er["src"], ffmpeg_bin))
+
+            st.markdown("---")
+            col_et, col_ec = st.columns([3, 1])
+            with col_et:
+                st.markdown("**Extracted Watermark Text**")
+                if er["text"]:
+                    st.code(er["text"], language="text")
+                else:
+                    st.warning(
+                        "No readable text was found. The video may not be "
+                        "watermarked, or was watermarked with a different payload."
+                    )
+            with col_ec:
+                st.markdown("**Detection Confidence**")
+                if er["confidence"] > 0:
+                    conf = er["confidence"]
+                    colour = "#21c354" if conf >= 80 else "#f0a500" if conf >= 50 else "#e03c31"
+                    st.markdown(
+                        f'<p style="font-size:2rem;font-weight:700;color:{colour}">'
+                        f'{conf:.1f}%</p>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.caption("Confidence score not available (older model format).")
+

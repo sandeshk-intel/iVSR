@@ -160,6 +160,8 @@ build_ffmpeg() {
   git apply --3way --whitespace=fix 0003-*.patch
   git apply --3way --whitespace=fix 0005-*.patch
   git apply --3way --whitespace=fix 0006-*.patch
+  git apply --3way --whitespace=fix 0007-*.patch
+  git apply --3way --whitespace=fix 0008-*.patch
 
   ./configure \
       --enable-gpl \

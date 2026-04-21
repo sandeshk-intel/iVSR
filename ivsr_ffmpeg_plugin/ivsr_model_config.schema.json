@@ -1,0 +1,84 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema",
+  "title": "iVSR Model Config",
+  "description": "Descriptor file for iVSR models loaded via model_type=-1. Covers tensor layout, precision, frame count, alignment, window strategy and normalisation.",
+  "type": "object",
+  "required": ["name", "in_layout"],
+  "additionalProperties": true,
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Human-readable model label used in log messages"
+    },
+    "nif": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Number of input frames consumed per inference call (1 = single frame)"
+    },
+    "align": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Round input width and height up to a multiple of this value (0 = no alignment)"
+    },
+    "in_layout": {
+      "type": "string",
+      "enum": ["NCHW", "NHWC", "NFHWC"],
+      "description": "Input tensor memory layout"
+    },
+    "in_precision": {
+      "type": ["string", "null"],
+      "enum": ["f32", "u8", "u16", null],
+      "description": "Input tensor element type (null = inherit from frame bit-depth)"
+    },
+    "out_layout": {
+      "type": "string",
+      "enum": ["NCHW", "NHWC", "NFHWC"],
+      "description": "Output tensor memory layout"
+    },
+    "out_precision": {
+      "type": ["string", "null"],
+      "enum": ["fp32", "u8", "u16", null],
+      "description": "Output tensor element type (null = default fp32)"
+    },
+    "model_color": {
+      "type": ["string", "null"],
+      "enum": ["RGB", "I420_Three_Planes", null],
+      "description": "Colour space string reported to iVSR SDK. null = determined by color_format_auto"
+    },
+    "out_order": {
+      "type": "string",
+      "enum": ["RGB", "BGR", "NONE"],
+      "description": "Output channel order for the ffmpeg proc helper"
+    },
+    "window_type": {
+      "type": "string",
+      "enum": ["single", "sliding", "in_queue"],
+      "description": "Frame queuing strategy: single (no queue), sliding (N-frame window), in_queue (read nif frames from task queue - BasicVSR style)"
+    },
+    "window_init_dup": {
+      "type": "boolean",
+      "description": "When window_type=sliding: duplicate first frame to prime the queue (TSENet). false = wait for queue to fill (RIFE)"
+    },
+    "normalize_input": {
+      "type": "boolean",
+      "description": "Divide uint8 pixel values by 255 before packing into float32 (RIFE/SPAN). false = raw [0,255] (VideoSeal)"
+    },
+    "normalize_output": {
+      "type": "boolean",
+      "description": "Multiply float32 output by 255 then clip to uint8 (RIFE/SPAN). false = direct round-and-clip (VideoSeal)"
+    },
+    "output_passthrough_dims": {
+      "type": "boolean",
+      "description": "Report output W/H = input W/H regardless of tensor (VideoProc passthrough models)"
+    },
+    "out_precision_depth_derived": {
+      "type": "boolean",
+      "description": "Derive output precision from frame bit depth: u8 for 8-bit, u16 for 10/16-bit (EDSR style)"
+    },
+    "color_format_auto": {
+      "type": "integer",
+      "enum": [0, 1, 2],
+      "description": "0 = use model_color. 1 = VideoProc-auto (RGB vs I420 from pixel format). 2 = CustVSR-auto (always I420)"
+    }
+  }
+}

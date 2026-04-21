@@ -60,17 +60,17 @@ For a detailed introduction to the iVSR SDK API, please refer to [this introduct
 We've also included a `vsr_sample` as a demonstration of its usage.
 
 In order to support the widely-used media processing solution FFmpeg, we've provided an iVSR SDK plugin to simplify integration.<br>
-This plugin is integrated into FFmpeg's `dnn_processing` filter in the [FFmpeg documentation](https://ffmpeg.org/ffmpeg-filters.html#dnn_005fprocessing-1) in the libavfilter library, serving as a new `ivsr` backend to this filter. Please note that the patches provided in this project are specifically for FFmpeg n7.1.<br>
+This plugin is integrated into FFmpeg's `dnn_processing` filter in the [FFmpeg documentation](https://ffmpeg.org/ffmpeg-filters.html#dnn_005fprocessing-1) in the libavfilter library, serving as a new `ivsr` backend to this filter. The patches provided in this project target **FFmpeg n8.1**.<br>
 
 ### 1.3.3 OpenVINO patches and extension
 In [this folder](./ivsr_ov/based_on_openvino_2022.3/patches), you'll find patches for OpenVINO that enable the Enhanced BasicVSR model. These patches utilize OpenVINO's [Custom OpenVINO™ Operations](https://docs.openvino.ai/2024/documentation/openvino-extensibility/custom-openvino-operations.html) feature, which allows users to support models with custom operations not inherently supported by OpenVINO.<br>
 These patches are specifically for OpenVINO 2022.3, meaning the Enhanced BasicVSR model will only work on OpenVINO 2022.3 with these patches applied.<br>
 
 ## 1.4 Capabilities of iVSR
-Currently, iVSR offers two AI media processing functionalities: Video Super Resolution (VSR) and Smart Video Processing (SVP) for bandwidth optimization. Both functionalities can be run on Intel CPUs and Intel GPUs (including Flex170, Arc770) via OpenVINO and FFmpeg.
+iVSR supports the following AI media processing tasks. All can run on Intel CPUs and Intel GPUs (including Flex170, Arc770) via OpenVINO and FFmpeg.
 
 ### 1.4.1 Video Super Resolution (VSR)
-Video Super Resolution (VSR) is a technique extensively employed in the AI media enhancement domain to upscale low-resolution videos to high-resolution. iVSR supports `Enhanced BasicVSR`, `Enhanced EDSR`, and `TSENet`. It also has the capability to be extended to support additional models.
+Video Super Resolution (VSR) upscales low-resolution video to high-resolution using AI. iVSR supports `Enhanced BasicVSR`, `Enhanced EDSR`, `TSENet`, and `RIFE` (frame interpolation). The architecture is open for new models without recompilation via the JSON config system — see [section 3.2](#32-run-with-ffmpeg).
 
 - #### i. Enhanced BasicVSR
   `BasicVSR` is a publicly available AI-based VSR algorithm. For more details on the public `BasicVSR`, please refer to this [paper](https://arxiv.org/pdf/2012.02181.pdf).<br><br>
@@ -100,6 +100,14 @@ Video Super Resolution (VSR) is a technique extensively employed in the AI media
   ```
   For each inference, the input data is the `(n-1)th`, `(n)th`, and `(n+1)th` frames combined. The output data is the `(N)th` frame. For the first frame, the input data is `1st`, `1st`, `2nd` frames combined. For the last frame, the input data is the `(n-1)th`, `(n)th`, `(n)th` frames combined.
 
+- #### iv. RIFE — Frame Interpolation
+  `RIFE` (Real-time Intermediate Flow Estimation) doubles the frame rate by synthesising an intermediate frame between each pair of consecutive input frames.<br><br>
+  Export the model with `rife_to_openvino.py` before use. Input must be `rgb24`; the model input tensor is `[1, 6, H, W]` (two RGB frames concatenated) normalised to [0, 1]. Input width and height must be multiples of 128.<br><br>
+  ```plaintext
+  Input shape:  [1, 6, H, W]  (2 × rgb24 frames, float32 [0,1])
+  Output shape: [1, 3, H, W]  (1 interpolated frame, float32 [0,1])
+  ```
+
 ### 1.4.2. Smart Video Processing (SVP)
 `SVP` is an AI-based video prefilter that enhances perceptual rate-distortion in video encoding. With `SVP`, encoded video streams maintain the same visual quality while reducing bandwidth usage.<br>
 
@@ -120,7 +128,36 @@ The input and output shapes are:
   Input shape: [1, (channels)1, H, W]
   Output shape: [1, (channels)1, H, W]
   ```
-<br>
+
+### 1.4.3. VideoSeal — Invisible Watermarking
+`VideoSeal` embeds an imperceptible watermark payload into each video frame using a learned image-restoration network. The payload is baked into the OpenVINO IR at export time (text → 256-bit binary). A separate detector network recovers the payload from a watermarked video without access to the original.
+
+The embedder model processes `[0, 255]` float32 NCHW frames and is resolution-specific (re-export per target resolution).
+
+```plaintext
+Embedder input shape:  [1, 3, H, W]  float32 [0, 255]  (fixed at export)
+Embedder output shape: [1, 3, H, W]  float32 [0, 255]
+Detector input shape:  [1, 3, 256, 256]  float32 [0, 1]  (resolution-independent)
+Detector output shape: [1, 257]  raw logits (index 0 = presence bit; 1–256 = payload bits)
+```
+
+### 1.4.4. New model enablement — JSON config system
+From patch 0007 onward, the iVSR FFmpeg backend uses a **model descriptor table** that drives all dispatch through function pointers and per-model metadata fields. Any model whose I/O follows a standard pattern can be registered by supplying a JSON config file — no C code changes or recompilation required.
+
+**Use `model_type=-1` with `model_config=path/to/config.json`** to load a new model:
+
+```bash
+ffmpeg ... -vf "format=rgb24,dnn_processing=dnn_backend=ivsr:model=mymodel.xml:\
+model_type=-1:model_config=models/mymodel.json" output.mp4
+```
+
+JSON configs are **not sufficient** when a model requires:
+- Multiple output frames per inference (multi-frame output queue, like BasicVSR)
+- Multiple independent input tensors (must be pre-fused into the OpenVINO graph at export time)
+- Non-RGB or non-8-bit output planes (Y-only, YUV planar, HDR, quantised)
+- Non-standard sliding window access patterns (asymmetric context, look-ahead)
+
+In those cases, write a `pack_input_<name>` / `unpack_output_<name>` C function and add one row to `model_table[]`. See `ivsr_ffmpeg_plugin/MODEL_ENABLEMENT_GUIDE.md` for the complete decision guide.
 
 # 2. Setup iVSR env on linux
 The software was validated on:
@@ -129,7 +166,7 @@ The software was validated on:
 - Host OS: Linux-based OS (Ubuntu 22.04 or Rocky Linux 9.3)
 - Docker-based OS: Ubuntu 22.04 or Rocky Linux 9.3
 - OpenVINO: [2022.3](https://github.com/openvinotoolkit/openvino/tree/2022.3.0), [2023.2](https://github.com/openvinotoolkit/openvino/tree/2023.2.0), or [2024.5](https://github.com/openvinotoolkit/openvino/tree/2024.5.0)
-- FFmpeg: [n7.1](https://github.com/FFmpeg/FFmpeg/tree/n7.1)
+- FFmpeg: [n8.1](https://github.com/FFmpeg/FFmpeg/tree/n8.1)
 
 Building iVSR requires the installation of the GPU driver (optional), OpenCV, OpenVINO, and FFmpeg.  
 We provide **three** ways to install requirements and build iVSR SDK & iVSR FFmpeg plugin:<br>
@@ -185,6 +222,14 @@ The `vsr_sample` is developed using the iVSR SDK and OpenCV. For detailed instru
 
 ## 3.2 Run with FFmpeg
 After applying the FFmpeg plugin patches and building FFmpeg, refer to [the FFmpeg command line samples](ivsr_ffmpeg_plugin/README.md#how-to-run-inference-with-ffmpeg-plugin) for instructions on running inference with FFmpeg.
+
+To run a **new model without C code changes**, use `model_type=-1` with a JSON config file:
+```bash
+ffmpeg -i input.mp4 \
+  -vf "format=rgb24,dnn_processing=dnn_backend=ivsr:model=mymodel.xml:\
+model_type=-1:model_config=models/mymodel.json" output.mp4
+```
+See [ivsr_ffmpeg_plugin/README.md — JSON Model Config System](ivsr_ffmpeg_plugin/README.md#json-model-config-system) for the full field reference and [ivsr_ffmpeg_plugin/MODEL_ENABLEMENT_GUIDE.md](ivsr_ffmpeg_plugin/MODEL_ENABLEMENT_GUIDE.md) for the complete developer guide.
 
 # 4. Model files
 iVSR supports only models in OpenVINO IR format. Contact your Intel representative to obtain the model files, as they are not included in the repo.

@@ -29,13 +29,11 @@ DEFAULT_OP_XML = str(
 # Default RIFE model path (sibling rife_ov directory)
 DEFAULT_RIFE_MODEL = str(_REPO_ROOT.parent / "rife_ov" / "rife.xml")
 
-# Local patched FFmpeg build (has model_type=6 / VideoSeal compiled in)
-DEFAULT_LOCAL_FFMPEG = str(
-    _REPO_ROOT / "ivsr_ffmpeg_plugin" / "ffmpeg" / "ffmpeg"
-)
-DEFAULT_LOCAL_LIBAVFILTER = str(
-    _REPO_ROOT / "ivsr_ffmpeg_plugin" / "ffmpeg" / "libavfilter"
-)
+# Local patched FFmpeg build (has model_type=6 / VideoSeal compiled in).
+# Resolved relative to the repo root; falls back to the system ffmpeg on PATH.
+_FFMPEG_VIDEOSEAL_DIR = _REPO_ROOT.parent / "ffmpeg_videoseal"
+DEFAULT_LOCAL_FFMPEG = str(_FFMPEG_VIDEOSEAL_DIR / "ffmpeg")
+DEFAULT_LOCAL_LIBAVFILTER = str(_FFMPEG_VIDEOSEAL_DIR / "libavfilter")
 
 # Mapping: display name → (model_type int, nif default, normalize_factor default,
 #          needs_extension, pixel_format, description)
@@ -1455,8 +1453,8 @@ with tab_rife:
     # ── Scale (128-aligned) ───────────────────────────────────────────────────
     st.markdown("#### Scale (must be multiples of 128)")
 
-    _def_w = _rife_src_info["width"] if _rife_src_info.get("width") else 640
-    _def_h = _rife_src_info["height"] if _rife_src_info.get("height") else 512
+    _def_w = _rife_src_info["width"] if _rife_src_info.get("width") else 1280
+    _def_h = _rife_src_info["height"] if _rife_src_info.get("height") else 720
 
     col_w, col_h = st.columns(2)
     with col_w:

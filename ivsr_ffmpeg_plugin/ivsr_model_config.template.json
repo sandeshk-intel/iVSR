@@ -1,0 +1,53 @@
+{
+  "_comment_PURPOSE": "Copy this file to mymodel_config.json and fill in the values below.",
+  "_comment_USAGE":   "Use with: dnn_backend=ivsr:model=mymodel.xml:model_type=-1:model_config=mymodel_config.json",
+  "_comment_VALIDATE":"jsonschema -i mymodel_config.json ivsr_model_config.schema.json",
+
+  "_comment_name":    "Human-readable label used in log messages",
+  "name":             "MyModel",
+
+  "_comment_nif":     "Number of input frames consumed per inference call (1=single frame, 2=RIFE-style, 3=TSENet-style)",
+  "nif":              1,
+
+  "_comment_align":   "Pad input W and H to a multiple of this value before reshaping (0=none, 128 for RIFE, 64 for VideoProc)",
+  "align":            0,
+
+  "_comment_in_layout":   "Tensor layout passed to iVSR SDK: NCHW | NHWC | NFHWC",
+  "in_layout":            "NCHW",
+
+  "_comment_in_precision":"Input element type sent to the SDK: f32 | u8 | u16  (omit or null to inherit from frame bit-depth)",
+  "in_precision":         "f32",
+
+  "_comment_out_layout":  "Output tensor layout: NCHW | NHWC | NFHWC",
+  "out_layout":           "NCHW",
+
+  "_comment_out_precision":"Output element type: fp32 | u8 | u16  (omit or null to use default fp32)",
+  "out_precision":        "fp32",
+
+  "_comment_model_color": "Colour space string sent to the iVSR SDK: RGB | I420_Three_Planes | null (null = no explicit colour space)",
+  "model_color":          "RGB",
+
+  "_comment_out_order":   "Output colour channel order for ff_proc_from_dnn_to_frame: RGB | BGR | NONE",
+  "out_order":            "RGB",
+
+  "_comment_window_type": "Frame queuing strategy: single (one frame, no queue), sliding (N-frame sliding window), in_queue (read nif frames from task queue, BasicVSR-style)",
+  "window_type":          "single",
+
+  "_comment_window_init_dup": "Only relevant when window_type=sliding. Set true to duplicate the first frame to prime the queue (TSENet behaviour). false = wait for the queue to fill naturally (RIFE behaviour).",
+  "window_init_dup":          false,
+
+  "_comment_normalize_input": "true = divide rgb24 uint8 pixel values by 255 before packing into float32 tensor (RIFE/SPAN style input [0,1]). false = pack raw [0,255] values (VideoSeal style).",
+  "normalize_input":           true,
+
+  "_comment_normalize_output": "true = multiply float32 output by 255 then clip to uint8 (RIFE/SPAN style output [0,1] → [0,255]). false = direct round-and-clip, model already outputs [0,255] (VideoSeal style).",
+  "normalize_output":           true,
+
+  "_comment_output_passthrough_dims": "true = report output W/H = input W/H regardless of model output tensor size (VideoProc passthrough models). false = use tensor dimensions.",
+  "output_passthrough_dims":          false,
+
+  "_comment_out_precision_depth_derived": "true = derive output tensor precision from the input frame bit depth: u8 for 8-bit, u16 for 10/16-bit (EDSR style). Overrides out_precision when true.",
+  "out_precision_depth_derived":         false,
+
+  "_comment_color_format_auto": "0 = use model_color string above. 1 = VideoProc-style auto-detect (RGB if input is RGB, I420_Three_Planes otherwise). 2 = CustVSR-style (always I420_Three_Planes).",
+  "color_format_auto":           0
+}

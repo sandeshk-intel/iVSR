@@ -1,0 +1,23 @@
+{
+  "_comment_model": "SPAN (Swift Parameter-free Attention Network) — single-image 4× super-resolution",
+  "_comment_repo":  "https://github.com/hongyuanyu/SPAN",
+  "_comment_input": "Single RGB frame; model expects float32 [0,1] NCHW — divide uint8 by 255 at input",
+  "_comment_output":"Float32 [0,1] NCHW; multiply by 255 at output to recover uint8 rgb24",
+
+  "name":             "SPAN_x4",
+  "nif":              1,
+  "align":            0,
+  "in_layout":        "NCHW",
+  "in_precision":     "f32",
+  "out_layout":       "NCHW",
+  "out_precision":    "fp32",
+  "model_color":      "RGB",
+  "out_order":        "RGB",
+  "window_type":      "single",
+  "window_init_dup":  false,
+  "normalize_input":  true,
+  "normalize_output": true,
+  "output_passthrough_dims":     false,
+  "out_precision_depth_derived": false,
+  "color_format_auto":           0
+}

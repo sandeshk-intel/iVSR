@@ -99,6 +99,8 @@ git apply --3way --whitespace=fix 0002-*.patch
 git apply --3way --whitespace=fix 0003-*.patch
 git apply --3way --whitespace=fix 0005-*.patch
 git apply --3way --whitespace=fix 0006-*.patch
+git apply --3way --whitespace=fix 0007-*.patch
+git apply --3way --whitespace=fix 0008-*.patch
 ```
 
 All `sed` commands that had previously been used to patch `configure` at build time have been removed — that logic is now fully encoded in patch 0004.
@@ -145,6 +147,8 @@ After a clean build from the updated `build.sh`:
 | `0003` | `git apply --3way` | `dnn_backend_ivsr.c` |
 | `0005` | `git apply --3way` | `dnn_backend_ivsr.c` |
 | `0006` | `git apply --3way` | `dnn_backend_ivsr.c` |
+| `0007` | `git apply --3way` | `dnn_backend_ivsr.c`, `dnn_interface.h` |
+| `0008` | `git apply --3way` | `ivsr_model_config.template.json` *(new)*, `ivsr_model_config.schema.json` *(new)*, `models/span_x4.json` *(new)* |
 
 ---
 
@@ -259,3 +263,169 @@ ffmpeg -i input.mp4 \
 ```
 
 `model_type=5` corresponds to the `RIFE` enum value.
+
+---
+
+## Complete model_table refactor + JSON config system — Patches 0007 & 0008
+
+### New files
+
+| File | Description |
+|---|---|
+| `patches/0007-Complete-model-table-refactor-and-JSON-config.patch` | All C source changes (both phases below) |
+| `patches/0008-Add-JSON-model-config-template-schema-and-SPAN-example.patch` | New JSON artifact files shipped alongside the plugin |
+| `ivsr_model_config.template.json` | Copy-and-edit template with inline `_comment_*` annotations for every supported field |
+| `ivsr_model_config.schema.json` | JSON Schema draft-07 for IDE validation and autocomplete |
+| `models/span_x4.json` | First ready-to-use config: SPAN 4× super-resolution |
+
+---
+
+### Phase 1 — Complete the model_table refactor (Patch 0007 Part A)
+
+Patches 0005 and 0006 introduced the `model_table[]` pattern for RIFE and VideoSeal. Patch 0007 Part A migrates the five remaining hardcoded `if (model_type == X)` chains for BasicVSR, TSENet, VideoProc, CustVSR, and EDSR into the table.
+
+#### Extended `ModelDesc` — 4 new fields
+
+| Field | Type | Purpose |
+|---|---|---|
+| `out_precision_depth_derived` | `int` | `1` = derive output tensor precision from frame bit-depth (replaces EDSR hardcode: u8 for 8-bit, u16 for 10/16-bit) |
+| `output_passthrough_dims` | `int` | `1` = report output W/H = input W/H regardless of tensor (replaces VideoProc `get_output_ivsr` hardcode) |
+| `color_format_auto` | `int` | `0` = use `model_color` string; `1` = VideoProc-auto (RGB vs I420 from pixel format); `2` = CustVSR-auto (always I420) |
+| `sliding_window_init_dup` | `int` | `1` = duplicate first frame to prime the queue on init (replaces TSENet-specific dup logic) |
+
+#### New per-model I/O functions
+
+| Function | Replaces |
+|---|---|
+| `pack_input_basicvsr` | BASICVSR inline branch in `fill_model_input_ivsr()` (reads `nif` frames from `task->in_queue`) |
+| `pack_input_tsenet` | TSENET inline branch in `fill_model_input_ivsr()` (sliding window with first-frame dup) |
+| `unpack_output_basicvsr` | BASICVSR inline loop in `infer_completion_callback()` (multi-frame `task->out_queue` iteration) |
+
+#### Counter unification
+
+`tsenet_frame_num` and `rife_frame_num` in `IVSRModel` collapsed into a single `sliding_window_frame_num` (safe: only one sliding-window model can be active per filter instance).
+
+#### Updated `model_table[]` (post-Patch-0007)
+
+| Enum | name | nif_override | channel_divisor | align | in_layout | in_precision | out_layout | pack_input | unpack_output | Notable flags |
+|---|---|---|---|---|---|---|---|---|---|---|
+| BASICVSR | BasicVSR | 0 (SDK) | 1 | 32 | NFHWC | null | NFHWC | `pack_input_basicvsr` | `unpack_output_basicvsr` | — |
+| VIDEOPROC | VideoProc | 0 (SDK) | 1 | 64 | NHWC | null | NHWC | null (generic) | null (generic) | `color_format_auto=1`, `output_passthrough_dims=1` |
+| EDSR | EDSR | 0 (SDK) | 1 | 0 | NHWC | null | NHWC | null (generic) | null (generic) | `out_precision_depth_derived=1` |
+| CUSTVSR | CustVSR | 0 (SDK) | 1 | 64 | NHWC | null | NHWC | null (generic) | null (generic) | `color_format_auto=2` |
+| TSENET | TSENet | 3 | 3 | 0 | NCHW | null | NHWC | `pack_input_tsenet` | null (generic) | `sliding_window_init_dup=1` |
+| RIFE | RIFE | 2 | 2 | 128 | NCHW | f32 | NCHW | `pack_input_rife` | `unpack_output_rife` | — |
+| VIDEOSEAL | VideoSeal | 1 | 1 | 0 | NCHW | f32 | NCHW | `pack_input_videoseal` | `unpack_output_videoseal` | — |
+
+**Result:** Zero `if (model_type == X)` chains remain in any hot-path function. Adding a new built-in model = one enum value + one `model_table[]` row + optional I/O functions. Compile-time assert (`model_table_wrong_size`) still guards row count.
+
+---
+
+### Phase 2 — JSON config system (Patch 0007 Part B)
+
+Adds the ability to run a new model without any C changes or recompilation: supply a `.json` descriptor file and set `model_type=-1`.
+
+#### `iVSROptions` changes (`dnn_interface.h`)
+
+New field: `char *model_config` — path to a JSON model descriptor file.
+
+#### `ModelType` enum change
+
+`UNKNOWN_MODEL = -1` renamed to `CUSTOM = -1` to reflect its new purpose.
+
+#### New `AVOption`
+
+```c
+{ "model_config",
+  "Path to a JSON model descriptor file. Use with model_type=-1. "
+  "Specifies tensor layout, precision, nif, align, window_type and normalisation "
+  "for models not built into the iVSR backend. "
+  "See ivsr_model_config.template.json for all supported fields.",
+  OFFSET(model_config), AV_OPT_TYPE_STRING, {.str=NULL}, 0, 0, FLAGS }
+```
+
+The `model_type` option's minimum value changed from `0` to `-1`.
+
+#### New `WindowType` enum
+
+| Value | Meaning |
+|---|---|
+| `WINDOW_SINGLE` | One frame per inference, no queue (RIFE/VideoSeal/SPAN style) |
+| `WINDOW_SLIDING` | N-frame sliding window via `frame_queue` |
+| `WINDOW_IN_QUEUE` | Read `nif` frames from `task->in_queue` (BasicVSR style) |
+
+#### Extended `ModelDesc` (Patch 0008 additions)
+
+| Field | Type | Purpose |
+|---|---|---|
+| `window_type` | `WindowType` | Frame queuing strategy for JSON-loaded models |
+| `normalize_input` | `int` | `1` = divide uint8 by 255 before packing into float32 (RIFE/SPAN); `0` = raw [0,255] (VideoSeal) |
+| `normalize_output` | `int` | `1` = multiply float32 by 255 before clipping to uint8; `0` = direct round-and-clip |
+
+#### New functions
+
+| Function | Purpose |
+|---|---|
+| `parse_model_config_json(ctx, path, &desc)` | Flat JSON parser (~200 lines, no external deps, uses `avio_open`). Keys beginning with `_` are silently ignored (comment support). Returns `AVERROR` on missing required fields. |
+| `pack_input_window(m, base, input, task)` | Generic input packing dispatcher — branches on `md->window_type` and applies `normalize_input`. Shared by all JSON-loaded models. |
+| `unpack_output_generic_fp32(m, task, output)` | Generic output unpacking — NCHW or NHWC float32 → rgb24; applies `normalize_output`. |
+| `free_dynamic_desc(&desc)` | Frees heap-allocated strings in a `ModelDesc` created by the JSON parser, then the struct itself. |
+| `get_model_desc(ivsr_model)` | **Central lookup helper** — returns `dynamic_desc` when present (JSON-loaded), else `&model_table[model_type]`. This is the only place `model_table` is accessed; all hot paths call through it. |
+
+#### `IVSRModel` struct additions
+
+- `ModelDesc *dynamic_desc` — heap-allocated descriptor for JSON-loaded models; `NULL` for built-in models.
+
+#### Load flow for `model_type=-1`
+
+```
+ff_dnn_load_model_ivsr()
+  └─ model_type == CUSTOM?
+       └─ parse_model_config_json()  →  ivsr_model->dynamic_desc
+  └─ get_model_desc()  ──►  dynamic_desc          (JSON-loaded)
+                       └──►  &model_table[type]    (built-in)
+  └─ apply: align, layout, precision, color_format, nif_override
+```
+
+#### JSON config field reference
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `name` | string | — | **Required.** Used in log messages |
+| `nif` | integer | 1 | Frames consumed per inference |
+| `align` | integer | 0 | W/H alignment in pixels (0 = none) |
+| `in_layout` | string | — | **Required.** `NCHW` \| `NHWC` \| `NFHWC` |
+| `in_precision` | string\|null | null | `f32` \| `u8` \| `u16` \| null (inherit from bit-depth) |
+| `out_layout` | string | `NCHW` | `NCHW` \| `NHWC` \| `NFHWC` |
+| `out_precision` | string\|null | null | `fp32` \| `u8` \| `u16` \| null |
+| `model_color` | string\|null | null | `RGB` \| `I420_Three_Planes` \| null |
+| `out_order` | string | `RGB` | `RGB` \| `BGR` \| `NONE` |
+| `window_type` | string | `single` | `single` \| `sliding` \| `in_queue` |
+| `window_init_dup` | boolean | false | Dup first frame on init (`sliding` only, TSENet behaviour) |
+| `normalize_input` | boolean | true | Divide uint8 by 255 → float32 [0,1] |
+| `normalize_output` | boolean | true | Multiply float32 by 255 → uint8 |
+| `output_passthrough_dims` | boolean | false | Output W/H = input W/H (VideoProc style) |
+| `out_precision_depth_derived` | boolean | false | Derive output precision from frame bit-depth (EDSR style) |
+| `color_format_auto` | integer | 0 | 0 = fixed; 1 = VideoProc-auto; 2 = CustVSR-auto |
+
+#### Example usage — SPAN 4× super-resolution
+
+```bash
+# Run with JSON config (no recompile, no C changes)
+ffmpeg -i input.mp4 \
+  -vf "format=rgb24,dnn_processing=dnn_backend=ivsr:model=span_x4.xml:\
+model_type=-1:model_config=models/span_x4.json" \
+  output.mp4
+```
+
+#### Model configs for existing built-in models
+
+| Model | `model_type` | Usable via JSON? | Blocker |
+|---|---|---|---|
+| Enhanced EDSR | 2 | ✅ Yes | None — `out_precision_depth_derived: true`, generic ff_proc path |
+| SVP / VideoProc | 1 | ✅ Yes | None — `color_format_auto: 1`, `output_passthrough_dims: true` |
+| Enhanced BasicVSR | 0 | ⚠️ Input only | `unpack_output_basicvsr` multi-frame `out_queue` loop has no generic JSON equivalent yet |
+| TSENet | 4 | ✅ Yes | `window_type: sliding`, `window_init_dup: true`, `nif: 3` |
+| RIFE | 5 | ✅ Yes | `window_type: sliding`, `normalize_input: true`, `normalize_output: true`, `nif: 2` |
+| VideoSeal | 6 | ✅ Yes | `window_type: single`, `normalize_input: false`, `normalize_output: false` |
+

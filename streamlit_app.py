@@ -29,11 +29,11 @@ DEFAULT_OP_XML = str(
 # Default RIFE model path (sibling rife_ov directory)
 DEFAULT_RIFE_MODEL = str(_REPO_ROOT.parent / "rife_ov" / "rife.xml")
 
-# Local patched FFmpeg build (has model_type=6 / VideoSeal compiled in).
-# Resolved relative to the repo root; falls back to the system ffmpeg on PATH.
-_FFMPEG_VIDEOSEAL_DIR = _REPO_ROOT.parent / "ffmpeg_videoseal"
-DEFAULT_LOCAL_FFMPEG = str(_FFMPEG_VIDEOSEAL_DIR / "ffmpeg")
-DEFAULT_LOCAL_LIBAVFILTER = str(_FFMPEG_VIDEOSEAL_DIR / "libavfilter")
+# Local patched FFmpeg build produced by build.sh — lives inside the repo at
+# ivsr_ffmpeg_plugin/ffmpeg/ (cloned + patched + compiled there by build_ffmpeg()).
+_LOCAL_FFMPEG_DIR = _REPO_ROOT / "ivsr_ffmpeg_plugin" / "ffmpeg"
+DEFAULT_LOCAL_FFMPEG = str(_LOCAL_FFMPEG_DIR / "ffmpeg")
+DEFAULT_LOCAL_LIBAVFILTER = str(_LOCAL_FFMPEG_DIR / "libavfilter")
 
 # Mapping: display name → (model_type int, nif default, normalize_factor default,
 #          needs_extension, pixel_format, description)
@@ -916,13 +916,8 @@ st.markdown(
 with st.sidebar:
     st.header("Global Settings")
 
-    ffmpeg_bin = st.text_input(
-        "FFmpeg binary path",
-        value=find_ffmpeg(),
-        help="Path to the iVSR-patched FFmpeg binary.",
-    )
+    ffmpeg_bin = find_ffmpeg()
 
-    st.markdown("---")
     st.caption(
         "**Models must be in OpenVINO IR format** (.xml + .bin). "
         "They are not included in the iVSR repo."
@@ -1741,7 +1736,7 @@ with tab_rife:
 # TAB 4 — VideoSeal Invisible Watermarking
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_vs:
-    st.subheader("Invisible Watermarking — VideoSeal (model_type=6)")
+    st.subheader("Invisible Watermarking — VideoSeal")
     st.markdown(
         "Embed an imperceptible per-frame watermark into a video using the "
         "[Meta VideoSeal](https://ai.meta.com/research/publications/videoseal/) model "
@@ -1885,33 +1880,28 @@ with tab_vs:
                     help="Ignored when FFV1 lossless is selected.",
                 )
 
-        st.markdown("---")
-        st.markdown("#### FFmpeg Binary & Library Path")
-        st.caption(
-            "VideoSeal requires the **locally built** iVSR-patched FFmpeg "
-            "(`model_type=6` is not in the system build). The `LD_LIBRARY_PATH` "
-            "must point to the freshly built `libavfilter` so the patched "
-            "`.so` is loaded instead of the system one."
-        )
-        col_fb, col_lp = st.columns(2)
-        with col_fb:
-            _local_ffmpeg_exists = os.path.isfile(DEFAULT_LOCAL_FFMPEG)
-            vs_ffmpeg_bin = st.text_input(
-                "FFmpeg binary (VideoSeal)",
-                value=DEFAULT_LOCAL_FFMPEG if _local_ffmpeg_exists else ffmpeg_bin,
-                key="vs_ffmpeg_bin",
-                help="Path to the locally built FFmpeg binary that has model_type=6 compiled in.",
+        # Auto-resolve the local FFmpeg built by build.sh (ivsr_ffmpeg_plugin/ffmpeg/).
+        _local_ffmpeg_exists = os.path.isfile(DEFAULT_LOCAL_FFMPEG)
+        vs_ffmpeg_bin = DEFAULT_LOCAL_FFMPEG if _local_ffmpeg_exists else ffmpeg_bin
+        vs_lib_path = DEFAULT_LOCAL_LIBAVFILTER if _local_ffmpeg_exists else ""
+        if not _local_ffmpeg_exists:
+            st.warning(
+                f"Local iVSR FFmpeg not found at `{DEFAULT_LOCAL_FFMPEG}`.  \n"
+                "Run `bash build.sh` from the repo root to build it."
             )
-        with col_lp:
-            vs_lib_path = st.text_input(
-                "LD_LIBRARY_PATH (libavfilter dir)",
-                value=DEFAULT_LOCAL_LIBAVFILTER,
-                key="vs_lib_path",
-                help=(
-                    "Directory containing the patched libavfilter.so.11. "
-                    "Leave blank if the system library is already up to date."
-                ),
-            )
+            with st.expander("Override FFmpeg paths (advanced)"):
+                vs_ffmpeg_bin = st.text_input(
+                    "FFmpeg binary",
+                    value=ffmpeg_bin,
+                    key="vs_ffmpeg_bin",
+                    help="Path to an iVSR-patched FFmpeg binary with model_type=6 compiled in.",
+                )
+                vs_lib_path = st.text_input(
+                    "LD_LIBRARY_PATH (libavfilter dir)",
+                    value="",
+                    key="vs_lib_path",
+                    help="Directory containing the patched libavfilter.so. Leave blank if already on system path.",
+                )
 
         # ── Command preview ───────────────────────────────────────────────────
         if vs_model_path and vs_input_video:
@@ -1950,7 +1940,7 @@ with tab_vs:
             if not os.path.isfile(vs_ffmpeg_bin):
                 errors.append(
                     f"FFmpeg binary not found: `{vs_ffmpeg_bin}`.  \n"
-                    "Build the iVSR-patched FFmpeg first: `cd sandesh/iVSR && bash build.sh`"
+                    "Run `bash build.sh` from the repo root to build the iVSR-patched FFmpeg."
                 )
             for e in errors:
                 st.error(e)
@@ -2097,6 +2087,8 @@ with tab_vs:
         # ── Video source ──────────────────────────────────────────────────────
         st.markdown("#### Video Source")
         _vs_embed_result = st.session_state.get("vs_result")
+        use_embed_output = False
+        vs_extract_src = None
         if _vs_embed_result and os.path.isfile(_vs_embed_result.get("output", "")):
             use_embed_output = st.checkbox(
                 "Use watermarked video produced by the Embed tab",
@@ -2106,19 +2098,14 @@ with tab_vs:
             if use_embed_output:
                 vs_extract_src = _vs_embed_result["output"]
                 st.caption(f"Using: `{vs_extract_src}`")
-            else:
-                vs_extract_src = None
-        else:
-            use_embed_output = False
-            vs_extract_src = None
 
+        vs_ext_video_file = st.file_uploader(
+            "Upload Watermarked Video",
+            type=["mp4", "mkv", "avi", "mov", "webm", "ts"],
+            key="vs_extract_upload",
+            help="Any video watermarked with VideoSeal.",
+        )
         if not use_embed_output:
-            vs_ext_video_file = st.file_uploader(
-                "Upload Watermarked Video",
-                type=["mp4", "mkv", "avi", "mov", "webm", "ts"],
-                key="vs_extract_upload",
-                help="Any video watermarked with VideoSeal.",
-            )
             vs_extract_src = save_upload(vs_ext_video_file, ".mp4", "vs_extract_video")
 
         st.markdown("---")

@@ -1,7 +1,19 @@
 #!/usr/bin/env python3
 """
-Export the RIFE_HDv3 PyTorch model to OpenVINO IR (.xml / .bin) 
+Export the RIFE PyTorch model to OpenVINO IR (.xml / .bin) 
 by routing through ONNX Opset 16 to preserve the grid_sample layers.
+
+Execution Instructions:
+-----------------------
+1. Clone the Practical-RIFE repository in the same directory as this script:
+   $ git clone https://github.com/hzwer/Practical-RIFE.git
+
+2. MANUAL DOWNLOAD REQUIRED (Offline Setup):
+   The official RIFE checkpoints are hosted on Google Drive.
+   - Visit the Model List: https://github.com/hzwer/Practical-RIFE/tree/main?tab=readme-ov-file#model-list
+   - Download the desired model zip file (e.g., RIFE v4.14).
+   - Extract the zip file. It will contain a folder named `train_log` (or similar).
+   - Place this `train_log` folder in the same directory as this script.
 
 Usage:
     python3 export_rife_openvino.py --model_dir ./train_log --height 768 --width 1280

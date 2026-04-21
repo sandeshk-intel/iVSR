@@ -1,4 +1,29 @@
 #!/usr/bin/env python3
+"""
+VideoSeal to OpenVINO IR Converter
+
+Execution Instructions:
+-----------------------
+1. Environment Setup:
+   Ensure PyTorch, OpenVINO, and Meta's official VideoSeal library are installed.
+   $ pip install torch openvino
+   $ pip install git+https://github.com/facebookresearch/VideoSeal.git
+
+2. Run the Export:
+   You can customize the baked-in watermark text and the target video resolution.
+   Because OpenVINO static shapes are highly optimized, the exported resolution 
+   MUST match your FFmpeg input stream exactly.
+
+   Example (Default 720p with "IVSR" watermark):
+   $ python3 export_videoseal_ov.py
+
+   Example (Custom 1080p with custom watermark):
+   $ python3 export_videoseal_ov.py --text "CONFIDENTIAL" --height 1080 --width 1920
+
+3. FFmpeg Integration:
+   Mount the resulting .xml file directly into your FFmpeg dnn_processing filter.
+   The model expects NCHW format natively.
+"""
 import argparse
 import torch
 import torch.nn as nn

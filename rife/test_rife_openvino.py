@@ -5,7 +5,7 @@ Dynamically pads and crops frames to satisfy RIFE_HDv3's multiple-of-128
 geometry requirement, and uses RGB color space to match the PyTorch export.
 
 Usage:
-    python3 test_rife_model.py --video input.mp4 --model ./rife_ov/rife.xml
+    python3 test_rife_openvino.py --video input.mp4 --model ./rife_ov/rife.xml
 """
 
 import argparse

@@ -4,6 +4,7 @@ Demonstrates Video Super Resolution (VSR) and Smart Video Processing (SVP)
 using the iVSR + FFmpeg pipeline.
 """
 
+import json
 import os
 import subprocess
 import tempfile
@@ -169,6 +170,7 @@ def build_ffmpeg_cmd(
     normalize_factor: float,
     extension: str = "",
     op_xml: str = "",
+    model_config: str = "",
     batch_size: int = 1,
     extra_encode_flags: str = "",
 ) -> list[str]:
@@ -191,6 +193,8 @@ def build_ffmpeg_cmd(
         dnn_filter += f":extension={extension}"
     if op_xml:
         dnn_filter += f":op_xml={op_xml}"
+    if model_config:
+        dnn_filter += f":model_config={model_config}"
 
     vf = f"format={pixel_format},{dnn_filter}"
 
@@ -925,11 +929,12 @@ with st.sidebar:
     st.caption("Source: [github.com/OpenVisualCloud/iVSR](https://github.com/OpenVisualCloud/iVSR)")
 
 # ── Main tabs ─────────────────────────────────────────────────────────────────
-tab_vsr, tab_svp, tab_rife, tab_vs = st.tabs([
+tab_vsr, tab_svp, tab_rife, tab_vs, tab_span = st.tabs([
     "Video Super Resolution (VSR)",
     "Smart Video Processing (SVP)",
     "Frame Interpolation (RIFE)",
     "Invisible Watermarking (VideoSeal)",
+    "Single-Image SR (SPAN)",
 ])
 
 
@@ -2168,4 +2173,289 @@ with tab_vs:
                     )
                 else:
                     st.caption("Confidence score not available (older model format).")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 5 — Single-Image SR (SPAN)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_SPAN_DEFAULT_CONFIG = {
+    "name": "SPAN",
+    "nif": 1,
+    "align": 0,
+    "in_layout": "NCHW",
+    "in_precision": "f32",
+    "out_layout": "NCHW",
+    "out_precision": "fp32",
+    "model_color": "RGB",
+    "out_order": "RGB",
+    "window_type": "single",
+    "window_init_dup": False,
+    "normalize_input": True,
+    "normalize_output": True,
+    "output_passthrough_dims": False,
+    "out_precision_depth_derived": False,
+}
+
+
+def _write_span_config(custom_json_bytes: bytes | None, scale: str | None) -> str:
+    """Write SPAN JSON config to a temp file.  Returns the file path."""
+    if custom_json_bytes:
+        cfg = json.loads(custom_json_bytes.decode())
+    else:
+        cfg = dict(_SPAN_DEFAULT_CONFIG)
+        cfg["name"] = f"SPAN-x{scale[0]}" if scale else "SPAN"
+    tmp = tempfile.NamedTemporaryFile(
+        suffix=".json", delete=False, mode="w", prefix="span_cfg_"
+    )
+    json.dump(cfg, tmp, indent=2)
+    tmp.close()
+    return tmp.name
+
+
+with tab_span:
+    st.subheader("Single-Image Super Resolution — SPAN")
+    st.markdown(
+        "Upscale video frames using the **SPAN** (Swift Parameter-free Attention Network) model. "
+        "SPAN is a fast, high-quality single-frame SR model with no frame queuing. "
+        "Export your SPAN checkpoint to OpenVINO IR (see `span_to_openvino.py`), "
+        "then upload the `.xml` / `.bin` pair and an input video below."
+    )
+
+    st.markdown("---")
+
+    st.info(
+        "Single-frame model — no temporal queuing, low latency.  \n"
+        "Scale factor is detected automatically from the output resolution after inference.  \n"
+        "Uses `model_type=-1` (JSON config system). "
+        "Normalization is handled inside the config (`normalize_input: true`)."
+    )
+
+    st.markdown("---")
+
+    # ── Model upload ──────────────────────────────────────────────────────────
+    col_xml_s, col_bin_s = st.columns(2)
+    with col_xml_s:
+        span_xml_file = st.file_uploader(
+            "Upload SPAN Model (.xml)",
+            type=["xml"],
+            key="span_xml_upload",
+            help="OpenVINO IR XML for the SPAN model.",
+        )
+    with col_bin_s:
+        span_bin_file = st.file_uploader(
+            "Upload SPAN Weights (.bin)",
+            type=["bin"],
+            key="span_bin_upload",
+            help="OpenVINO IR binary weights matching the .xml.",
+        )
+    span_model_path = save_model_uploads(span_xml_file, span_bin_file, "span")
+
+    # ── JSON config upload (optional) ─────────────────────────────────────────
+    with st.expander("JSON Config (optional — default provided)", expanded=False):
+        st.markdown(
+            "If you leave this empty, a default SPAN config is used automatically. "
+            "Upload a custom `.json` only if you need non-default settings "
+            "(e.g. `normalize_output: false`, raw precision output, etc.)."
+        )
+        span_cfg_file = st.file_uploader(
+            "Upload Custom JSON Config",
+            type=["json"],
+            key="span_cfg_upload",
+            help="Must conform to `ivsr_model_config.schema.json`.",
+        )
+        with st.expander("View default config", expanded=False):
+            st.json(_SPAN_DEFAULT_CONFIG)
+
+    # ── Input video ───────────────────────────────────────────────────────────
+    span_video_file = st.file_uploader(
+        "Upload Input Video",
+        type=["mp4", "mkv", "avi", "mov", "webm", "ts"],
+        key="span_video_upload",
+    )
+    span_input_video = save_upload(span_video_file, ".mp4", "span_video")
+    span_output_video = os.path.join(tempfile.gettempdir(), "ivsr_span_output.mp4")
+
+    st.markdown("---")
+    st.markdown("#### Parameters")
+
+    col_sp1, col_sp2 = st.columns(2)
+    with col_sp1:
+        span_device = st.selectbox(
+            "Target Device",
+            DEVICE_OPTIONS,
+            index=0,
+            key="span_device",
+            help="Hardware to run inference on.",
+        )
+    with col_sp2:
+        span_nireq = st.number_input(
+            "Inference Requests (nireq)",
+            min_value=1,
+            max_value=32,
+            value=1,
+            step=1,
+            key="span_nireq",
+            help="Number of parallel OpenVINO inference requests.",
+        )
+
+    col_sp3, col_sp4 = st.columns(2)
+    with col_sp3:
+        _span_gpu = span_device.startswith("GPU") or span_device in ("MULTI:GPU.0,GPU.1", "AUTO")
+        span_num_streams = st.number_input(
+            "GPU Streams (num_streams)",
+            min_value=1,
+            max_value=16,
+            value=1,
+            step=1,
+            disabled=not _span_gpu,
+            key="span_num_streams",
+            help="Throughput streams for GPU only.",
+        )
+    with col_sp4:
+        span_batch = st.number_input(
+            "Batch Size",
+            min_value=1,
+            max_value=32,
+            value=1,
+            step=1,
+            key="span_batch",
+            help="Number of frames processed per inference call.",
+        )
+
+    # ── Command preview ───────────────────────────────────────────────────────
+    if span_model_path and span_input_video:
+        _span_cfg_bytes = span_cfg_file.read() if span_cfg_file else None
+        _span_cfg_path = _write_span_config(_span_cfg_bytes, None)
+        _span_preview_cmd = build_ffmpeg_cmd(
+            ffmpeg_bin=ffmpeg_bin,
+            input_video=span_input_video,
+            output_video=span_output_video,
+            model_path=span_model_path,
+            pixel_format="rgb24",
+            model_type=-1,
+            nif=1,
+            nireq=span_nireq,
+            num_streams=span_num_streams,
+            device=span_device,
+            normalize_factor=1.0,
+            model_config=_span_cfg_path,
+            batch_size=span_batch,
+        )
+        st.markdown("---")
+        with st.expander("Generated FFmpeg Command", expanded=False):
+            st.code(cmd_to_display_string(_span_preview_cmd), language="bash")
+
+    # ── Run button ─────────────────────────────────────────────────────────────
+    span_run = st.button("Run SPAN SR", key="span_run")
+    if span_run:
+        errors = []
+        if not span_model_path:
+            errors.append("Upload both the SPAN .xml and .bin model files.")
+        if not span_input_video:
+            errors.append("Upload an input video file.")
+        if errors:
+            for e in errors:
+                st.error(e)
+        else:
+            _span_cfg_bytes = span_cfg_file.read() if span_cfg_file else None
+            _span_cfg_path = _write_span_config(_span_cfg_bytes, None)
+            cmd = build_ffmpeg_cmd(
+                ffmpeg_bin=ffmpeg_bin,
+                input_video=span_input_video,
+                output_video=span_output_video,
+                model_path=span_model_path,
+                pixel_format="rgb24",
+                model_type=-1,
+                nif=1,
+                nireq=span_nireq,
+                num_streams=span_num_streams,
+                device=span_device,
+                normalize_factor=1.0,
+                model_config=_span_cfg_path,
+                batch_size=span_batch,
+            )
+            _span_probe = probe_video(span_input_video, ffmpeg_bin)
+            _span_total = int(_span_probe["nb_frames"]) if str(_span_probe["nb_frames"]).isdigit() else 0
+            _span_status = st.empty()
+            with st.spinner("Running SPAN inference..."):
+                rc, stderr, elapsed = run_ffmpeg(cmd, _span_status, total_frames=_span_total)
+            _span_status.empty()
+
+            if rc == 0:
+                with st.spinner("Optimising output for playback..."):
+                    apply_faststart(span_output_video, ffmpeg_bin)
+                in_info = probe_video(span_input_video, ffmpeg_bin)
+                out_info = probe_video(span_output_video, ffmpeg_bin)
+                throughput = (
+                    round(int(out_info["nb_frames"]) / elapsed, 1)
+                    if out_info["nb_frames"] != "N/A" else None
+                )
+                _in_w = in_info.get("width") or 0
+                _out_w = out_info.get("width") or 0
+                detected_scale = (
+                    f"{round(_out_w / _in_w)}×" if _in_w and _out_w else "?"
+                )
+                st.session_state["span_result"] = {
+                    "output": span_output_video,
+                    "input": span_input_video,
+                    "elapsed": elapsed,
+                    "in_info": in_info,
+                    "out_info": out_info,
+                    "throughput": throughput,
+                    "scale": detected_scale,
+                }
+            else:
+                st.session_state.pop("span_result", None)
+                st.error(f"FFmpeg failed (exit code {rc})")
+                with st.expander("FFmpeg stderr"):
+                    st.code(stderr, language="text")
+
+    # ── Results ────────────────────────────────────────────────────────────────
+    if "span_result" in st.session_state:
+        res = st.session_state["span_result"]
+        ii = res.get("in_info", {})
+        oi = res.get("out_info", {})
+        st.success(
+            f"Done in **{res['elapsed']:.1f}s** | "
+            + (f"Throughput: {res['throughput']} fps" if res.get("throughput") else "")
+        )
+
+        res_str = lambda w, h: f"{w}×{h}" if w else "N/A"
+        size_str = lambda s: f"{s / 1024 / 1024:.1f} MB" if s else "N/A"
+        br_str = lambda k: f"{k:,} kbps" if k else "N/A"
+        dur_str = lambda d: f"{int(d // 60)}m {d % 60:.1f}s" if d else "N/A"
+        frames_str = lambda n: str(n) if n != "N/A" else "N/A"
+
+        col_in_s, col_out_s = st.columns(2)
+        with col_in_s:
+            st.markdown("**Input Video**")
+            st.video(make_preview(res["input"], ffmpeg_bin))
+            stats_block(
+                stat("Resolution", res_str(ii.get("width"), ii.get("height"))),
+                stat("Bitrate",    br_str(ii.get("bitrate_kbps", 0))),
+                stat("File Size",  size_str(ii.get("size", 0))),
+                stat("Duration",   dur_str(ii.get("duration", 0))),
+                stat("Frames",     frames_str(ii.get("nb_frames", "N/A"))),
+            )
+        with col_out_s:
+            st.markdown(f"**Output Video (SPAN {res['scale']} Super-Resolved)**")
+            if os.path.isfile(res["output"]):
+                st.video(res["output"])
+                stats_block(
+                    stat("Resolution", res_str(oi.get("width"), oi.get("height"))),
+                    stat("Bitrate",    br_str(oi.get("bitrate_kbps", 0))),
+                    stat("File Size",  size_str(oi.get("size", 0))),
+                    stat("Duration",   dur_str(oi.get("duration", 0))),
+                    stat("Frames",     frames_str(oi.get("nb_frames", "N/A"))),
+                )
+                st.download_button(
+                    "Download Output",
+                    data=open(res["output"], "rb").read(),
+                    file_name=f"span_{res['scale'].replace('×','x')}_output.mp4",
+                    mime="video/mp4",
+                    key="span_download",
+                )
+            else:
+                st.warning("Output file not found.")
 

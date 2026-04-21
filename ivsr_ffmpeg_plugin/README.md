@@ -17,7 +17,7 @@ Additionally, there are other parameters that you can use. These parameters are 
 |input|input name of the model|NULL|input|
 |output|output name of the model|NULL|output|
 |device|device for inference task|CPU|CPU or GPU|
-|model_type|type for built-in models; `-1` = external JSON config via `model_config`|0|0 Enhanced BasicVSR, 1 SVP, 2 Enhanced EDSR, 3 CustVSR, 4 TSENet, 5 RIFE, 6 VideoSeal, **-1 JSON config**|
+|model_type|type for built-in models; `-1` = external JSON config via `model_config`|0|0 Enhanced BasicVSR, 1 SVP, 2 Enhanced EDSR, 3 CustVSR, 4 TSENet, 5 RIFE, 6 VideoSeal, **-1 JSON config (e.g. SPAN)**|
 |model_config|path to a JSON model descriptor file — use with `model_type=-1`; see `ivsr_model_config.template.json` for all fields|NULL|path to a `.json` config file|
 |normalize_factor|normalizing factor for models that do not require input normalization to [0, 1]|1.0|255.0 for Enhanced EDSR, 1.0 for all other models|
 |num_streams|number of execution streams for throughput mode (valid only for GPU devices)|1|use `benchmark_app` to determine the best value|
@@ -59,7 +59,7 @@ cd <iVSR project path>/ivsr_ffmpeg_plugin/ffmpeg
 cd <iVSR project path>/ivsr_ffmpeg_plugin/ffmpeg
 ./ffmpeg -i <your test video> -vf format=rgb24,dnn_processing=dnn_backend=ivsr:model=<tsenet_model.xml>:input=input:output=output:nif=1:device=<CPU or GPU>:model_type=4 -pix_fmt yuv420p test_out.mp4
 ```
-- Command sample to run RIFE frame interpolation inference (doubles frame rate), the input pixel format supported by the model is `rgb24`. Export the model with `rife_to_openvino.py` first.
+- Command sample to run RIFE frame interpolation inference (doubles frame rate), the input pixel format supported by the model is `rgb24`. Export the model with `export_rife_openvino.py` first.
 ```
 cd <iVSR project path>/ivsr_ffmpeg_plugin/ffmpeg
 ./ffmpeg -i <your test video> \
@@ -81,13 +81,55 @@ For bit-exact lossless output (recommended when extraction accuracy is critical)
 ```
   -c:v ffv1 -level 3 -pix_fmt rgb24 test_out_watermarked.mkv
 ```
-- Command sample to run a **new model without any C code changes** using the JSON config system (`model_type=-1`). Export the model to OpenVINO IR first, then write a JSON config (copy `ivsr_model_config.template.json` as a starting point). Example with SPAN 4× super-resolution:
-```
-cd <iVSR project path>/ivsr_ffmpeg_plugin/ffmpeg
-./ffmpeg -i <your test video> \
-  -vf "format=rgb24,dnn_processing=dnn_backend=ivsr:model=<span_x4.xml>:model_type=-1:model_config=<path_to>/models/span_x4.json" \
-  test_out_sr4x.mp4
-```
+- Command sample to run **SPAN single-image super-resolution** (2× or 4×) using the JSON config system (`model_type=-1`).
+
+  **Step 1 — Export the SPAN checkpoint to OpenVINO IR** (run once per scale factor):
+  ```bash
+  cd <iVSR project path>/span
+  python3 export_span_openvino.py --weights spanx4_ch48.pth --scale 4 --channels 48
+  # → spanx4_ch48_ir/spanx4_ch48.xml + spanx4_ch48_ir/spanx4_ch48.bin
+
+  # For 2× upscaling:
+  python3 export_span_openvino.py --weights spanx2_ch48.pth --scale 2 --channels 48
+  # → spanx2_ch48_ir/spanx2_ch48.xml + .bin
+  ```
+
+  **Step 2 — Write the JSON config** (copy `ivsr_model_config.template.json` or use this minimal version):
+  ```json
+  {
+    "name": "SPAN-x4",
+    "nif": 1,
+    "align": 0,
+    "in_layout": "NCHW",
+    "in_precision": "f32",
+    "out_layout": "NCHW",
+    "out_precision": "fp32",
+    "model_color": "RGB",
+    "out_order": "RGB",
+    "window_type": "single",
+    "window_init_dup": false,
+    "normalize_input": true,
+    "normalize_output": true,
+    "output_passthrough_dims": false,
+    "out_precision_depth_derived": false
+  }
+  ```
+  For 2× change `"name"` to `"SPAN-x2"` only; all other fields are identical.
+
+  **Step 3 — Run inference:**
+  ```bash
+  cd <iVSR project path>/ivsr_ffmpeg_plugin/ffmpeg
+  ./ffmpeg -i <your test video> \
+    -vf "format=rgb24,dnn_processing=dnn_backend=ivsr:\
+  model=<path>/spanx4_ch48.xml:input=input:output=output:\
+  model_type=-1:model_config=<path>/span_x4.json:device=CPU" \
+    -pix_fmt yuv420p test_out_span4x.mp4
+  ```
+  The output resolution is automatically set by the model (e.g. 480p → 1920p for 4×).
+
+  > **Note:** The Streamlit demo app (*Single-Image SR (SPAN)* tab) auto-generates the JSON config and runs
+  > this command — just upload the `.xml` / `.bin` pair and input video.
+
 See [JSON Model Config](#json-model-config-system) section below for full details.
 
 ## VideoSeal — Two Separate OpenVINO IR Models

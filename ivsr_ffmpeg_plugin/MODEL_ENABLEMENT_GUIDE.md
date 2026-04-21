@@ -345,7 +345,7 @@ make -C /path/to/ffmpeg -j$(nproc) 2>&1 | grep -E "error:|model_table"
 
 | Script | Model | Key flags | Output files | Notes |
 |---|---|---|---|---|
-| `rife_to_openvino.py` | RIFE | `--checkpoint`, `--height`, `--width` | `rife.xml` + `.bin` | Re-export if resolution changes |
+| `export_rife_openvino.py` | RIFE | `--checkpoint`, `--height`, `--width` | `rife.xml` + `.bin` | Re-export if resolution changes |
 | `videoseal/export_videoseal_openvino.py` | VideoSeal embedder | `--text`, `--height`, `--width` | `videoseal_baked_<H>p.xml` + `.bin` | Re-export per payload text and resolution |
 | `videoseal/export_videoseal_detector_openvino.py` | VideoSeal detector | none | `videoseal_detector.xml` + `.bin` | Export once; resolution-independent |
 | `span_to_openvino.py` *(planned)* | SPAN | `--checkpoint`, `--scale 2\|3\|4`, `--feature_channels` | `span_x<N>.xml` + `.bin` | One export per scale factor |

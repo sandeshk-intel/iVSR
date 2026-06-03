@@ -88,8 +88,8 @@ index f612f88..d61f7c8 100644
 +                                       const int dstStride[])
 +{
 +    int y, x;
-+    ptrdiff_t srcStrideUint16 = srcStride[0] >> 1;
-+    ptrdiff_t dstStrideFloat = dstStride[0] >> 2;
++    const ptrdiff_t srcStrideUint16 = srcStride[0] >> 1;
++    const ptrdiff_t dstStrideFloat = dstStride[0] >> 2;
 +    const uint16_t *srcPtr = (const uint16_t *)(src[0] + srcStride[0] * srcSliceY);
 +    float *dstPtr = (float *)(dst[0] + dstStride[0] * srcSliceY);
 +    const float float_norm_factor = 1.0f / 65535.0f;
@@ -112,8 +112,8 @@ index f612f88..d61f7c8 100644
 +                                       const int dstStride[])
 +{
 +    int y, x;
-+    ptrdiff_t srcStrideFloat = srcStride[0] >> 2;
-+    ptrdiff_t dstStrideUint16 = dstStride[0] >> 1;
++    const ptrdiff_t srcStrideFloat = srcStride[0] >> 2;
++    const ptrdiff_t dstStrideUint16 = dstStride[0] >> 1;
 +    const float *srcPtr = (const float *)(src[0] + srcStride[0] * srcSliceY);
 +    uint16_t *dstPtr = (uint16_t *)(dst[0] + dstStride[0] * srcSliceY);
 +
@@ -135,8 +135,8 @@ index f612f88..d61f7c8 100644
 +                                       const int dstStride[])
 +{
 +    int y, x;
-+    ptrdiff_t srcStrideUint16 = srcStride[0] >> 1;
-+    ptrdiff_t dstStrideFloat = dstStride[0] >> 2;
++    const ptrdiff_t srcStrideUint16 = srcStride[0] >> 1;
++    const ptrdiff_t dstStrideFloat = dstStride[0] >> 2;
 +    const uint16_t *srcPtr = (const uint16_t *)(src[0] + srcStride[0] * srcSliceY);
 +    float *dstPtr = (float *)(dst[0] + dstStride[0] * srcSliceY);
 +    const float float_norm_factor = 1.0f / 1023.0f;
@@ -159,8 +159,8 @@ index f612f88..d61f7c8 100644
 +                                       const int dstStride[])
 +{
 +    int y, x;
-+    ptrdiff_t srcStrideFloat = srcStride[0] >> 2;
-+    ptrdiff_t dstStrideUint16 = dstStride[0] >> 1;
++    const ptrdiff_t srcStrideFloat = srcStride[0] >> 2;
++    const ptrdiff_t dstStrideUint16 = dstStride[0] >> 1;
 +    const float *srcPtr = (const float *)(src[0] + srcStride[0] * srcSliceY);
 +    uint16_t *dstPtr = (uint16_t *)(dst[0] + dstStride[0] * srcSliceY);
 +

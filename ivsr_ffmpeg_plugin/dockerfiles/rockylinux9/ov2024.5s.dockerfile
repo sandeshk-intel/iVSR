@@ -101,6 +101,17 @@ RUN wget ${LIBX265} && \
     make -j16 && \
     make install
 
+# Build SVT-AV1
+ARG SVTAV1_VER="v4.2.0"
+ARG SVTAV1_REPO="https://gitlab.com/AOMediaCodec/SVT-AV1.git"
+ARG SVTAV1_DIR=${WORKSPACE}/ivsr/svt-av1
+WORKDIR ${SVTAV1_DIR}
+RUN git clone --branch ${SVTAV1_VER} --depth 1 ${SVTAV1_REPO} . && \
+    cd Build && \
+    cmake .. -G"Unix Makefiles" -DCMAKE_BUILD_TYPE=Release && \
+    make -j$(nproc) && \
+    make install
+
 ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
 ENV LD_LIBRARY_PATH=${IVSR_SDK_DIR}/lib:/usr/local/lib:$LD_LIBRARY_PATH
 
@@ -136,6 +147,7 @@ RUN ./configure \
 --enable-gpl \
 --enable-libx264 \
 --enable-libx265 \
+--enable-libsvtav1 \
 --enable-version3 && \
 make -j16 && \
 make install

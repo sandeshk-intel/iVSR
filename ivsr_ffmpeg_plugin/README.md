@@ -203,6 +203,14 @@ cp model_configs/edsr_config.json custom_edsr.json
 ./ffmpeg ... model_config=custom_edsr.json ...
 ```
 
+### Generating a `model_config` JSON from a new IR model
+For a new OpenVINO IR model (not one of the 8 built-in ones), use `generate_ivsr_model_config.py` (in the project root) to produce a starting `model_config` JSON instead of writing one by hand:
+```bash
+cd <iVSR project path>
+python3 generate_ivsr_model_config.py <path/to/model>.xml -o custom_model_config.json
+```
+It parses the IR's `Parameter`/`Result` layers to auto-detect `in_layout`, `nif`, `channel_divisor`, `in_precision`, `out_precision`, SR scale, `window_type`, and `align`, and reads the model's `.bin` weights to detect any baked-in pixel normalization (e.g. a `Divide(255)` or per-channel mean `Subtract`/`Add` sitting directly on the input) to infer `normalize_input`/`normalize_output`. Fields it cannot infer from the IR alone (e.g. `color_format_auto`, or `normalize_input`/`output` when no baked op is found) are flagged as unconfirmed and prompted for interactively — pass `--non-interactive` to accept the safe defaults instead. Always diff the generated JSON against the closest canonical config in `model_configs/` before using it.
+
 ---
 
 ## Troubleshooting
@@ -224,3 +232,4 @@ cp model_configs/edsr_config.json custom_edsr.json
 - **Build Guide**: `PATCH_APPLIED.md` - Build and verification instructions
 - **Model Configs**: `model_configs/*.json` - Canonical configuration files
 - **Template**: `ivsr_model_config.template.json` - All available config fields
+- **Config Generator**: `../generate_ivsr_model_config.py` - Auto-generates a `model_config` JSON from a new IR model
